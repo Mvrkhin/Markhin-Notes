@@ -16866,7 +16866,12 @@ function mu_cloudBackupRowHtml(e, opts){
 
 async function markhinDash_showCloudPanel(){
     const fa=currentLang==='fa';
-    showAdvanced(markhinDash_headHtml(`☁️ ${fa?'بکاپ Cloud تلگرام':'Telegram Cloud Backup'}`,true)+
+    // This panel is opened from the standalone ☁️ toolbar button (not from
+    // inside the Dashboard), so there is no Dashboard screen underneath it
+    // to go "back" to — the ✕ button should just close the overlay
+    // (closeAdvancedModal), not jump into markhinDashboardMain() the way a
+    // real Dashboard sub-screen's ✕ would.
+    showAdvanced(markhinDash_headHtml(`☁️ ${fa?'بکاپ Cloud تلگرام':'Telegram Cloud Backup'}`,false)+
         `<div id="cloudPanelBody" style="font-size:12.5px;line-height:1.9">${fa?'در حال بررسی...':'Checking...'}</div>`);
     await markhinDash_renderCloudPanelBody();
 }
