@@ -8391,6 +8391,7 @@ window.mu_syncHtmlBg = function(){
             <div class="advanced-tools-row advanced-tools-row-2">
                 <button class="btn-main" id="btnMorseCode" onclick="openMorseTool()">📡 کد مورس</button>
                 <button class="btn-main" id="btnBinaryCode" onclick="openBinaryTool()">🔢 کد باینری</button>
+                <button class="btn-main" id="btnTelegramCloudBackup" style="display:none" onclick="markhinDash_showCloudPanel()">☁️ بکاپ Cloud تلگرام</button>
             </div>
         </div>
 
@@ -8502,6 +8503,13 @@ window.mu_syncHtmlBg = function(){
             TG = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
             IS_TELEGRAM = !!TG || /Telegram/i.test(navigator.userAgent || '');
             hasCloudStorage = !!(TG && TG.CloudStorage);
+            // Reflects the same IS_TELEGRAM && hasCloudStorage condition that used to
+            // gate the "☁️ Telegram Cloud Backup" button inside the Dashboard modal —
+            // that button now lives in the "ابزارهای ویژه" (Special Tools) toolbar
+            // section instead, so it's shown/hidden here as soon as we know whether
+            // Telegram's CloudStorage is actually available.
+            var mu_tgCloudBtn = document.getElementById('btnTelegramCloudBackup');
+            if (mu_tgCloudBtn) mu_tgCloudBtn.style.display = (IS_TELEGRAM && hasCloudStorage) ? '' : 'none';
             try { TG && TG.ready && TG.ready(); TG && TG.expand && TG.expand(); } catch (_) {}
             // Stops Telegram's own "swipe down to minimize the mini app" gesture from
             // competing with normal in-app scrolling/dragging (note lists, the drawing
@@ -8651,16 +8659,46 @@ window.mu_syncHtmlBg = function(){
            4096 characters — nowhere near enough for embedded base64 images (a
            single photo can be hundreds of KB), so this backs up note TEXT and
            metadata only; images always stay local-only on the device that has
-           them. The JSON payload is split across as many small `mk_c{n}` keys
-           as needed, with an `mk_meta` key describing how many chunks exist.
-           This is a manual backup/restore via Dashboard → ☁️ Cloud Backup, not
-           silent auto-merging — so it can never quietly overwrite a newer local
-           edit with a stale cloud copy. Auto-backup (scheduleCloudBackup) only
-           ever *pushes* the latest data up; pulling back down always requires
-           the person to tap Restore and confirm.
+           them.
+
+           Two kinds of backup share this same engine:
+             - "auto": one single slot (id 'auto') that scheduleCloudBackup()
+               silently overwrites a few seconds after every edit — a safety
+               net, not a history. Restoring still always requires the person
+               to tap Restore and confirm; auto-backup only ever *pushes*.
+             - "manual": a person-created snapshot from Dashboard → ☁️ Cloud
+               Backup → "Save a new backup", optionally with a short label the
+               person types in (e.g. "before clearing the work folder") so a
+               list of several snapshots stays identifiable at a glance. Up to
+               MAX_MANUAL_BACKUPS of these are kept side by side, each its own
+               restorable point in time, listed newest-first, viewable, and
+               deletable individually.
+           Every backup (auto or manual) is one entry in a small `mk_idx` index
+           plus its own payload split across `mk_b_{id}_{n}` chunk keys, sized
+           so that one auto slot + MAX_MANUAL_BACKUPS manual slots can never
+           together approach Telegram's 1024-key ceiling.
+
+           The payload is gzip-compressed (via the browser's CompressionStream,
+           then base64-encoded) before it's chunked, whenever that API exists —
+           JSON note text typically shrinks 3-5x, so this fits a meaningfully
+           larger note collection in the same per-backup key budget. Each
+           entry records whether ITS payload was compressed (`c: 1`), so a
+           backup written by an older/newer WebView is always read back
+           correctly either way. Where CompressionStream isn't available (a
+           handful of older embedded WebViews), it falls back to plain JSON
+           exactly as before — never a hard failure.
            ===================================================================== */
         let hasCloudStorage = !!(TG && TG.CloudStorage);
         const CLOUD_CHUNK_SIZE = 3500; // safely under Telegram's 4096-char/value limit
+        const CLOUD_INDEX_KEY = 'mk_idx';
+        const CLOUD_BACKUP_PREFIX = 'mk_b_';
+        const MAX_MANUAL_BACKUPS = 7;
+        const MAX_CHUNKS_PER_BACKUP = 118; // (1 auto + 7 manual) * 118 = 944 keys + 1 index key = 945,
+        // leaving a ~79-key (~7.7%) safety margin under Telegram's hard 1024-key ceiling.
+        const CLOUD_LABEL_MAX_LEN = 60;
+        // Pre-upgrade key names, kept only so cloudReadIndex() can migrate a
+        // person's existing single backup into the new format the first time
+        // this version runs — nothing new is ever written under these names.
         const CLOUD_META_KEY = 'mk_meta';
         const CLOUD_CHUNK_PREFIX = 'mk_c';
 
@@ -8690,6 +8728,52 @@ window.mu_syncHtmlBg = function(){
                 catch (e) { resolve(false); }
             });
         }
+        function cloudBackupChunkKeys(id, count) {
+            const keys = [];
+            for (let i = 0; i < count; i++) keys.push(CLOUD_BACKUP_PREFIX + id + '_' + i);
+            return keys;
+        }
+
+        // Chunked byte<->base64 conversion — chunked so a call stack limit on
+        // String.fromCharCode.apply is never hit even for a large (several
+        // hundred KB) compressed payload.
+        function cloudBytesToBase64(bytes) {
+            let binary = '';
+            const step = 0x8000;
+            for (let i = 0; i < bytes.length; i += step) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + step));
+            return btoa(binary);
+        }
+        function cloudBase64ToBytes(b64) {
+            const binary = atob(b64);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+            return bytes;
+        }
+        // Gzips + base64-encodes a string when the browser supports it and it
+        // actually comes out smaller; otherwise returns the string unchanged.
+        // Never throws — any failure just falls back to uncompressed.
+        async function cloudCompress(str) {
+            if (typeof CompressionStream === 'undefined') return { data: str, compressed: false };
+            try {
+                const cs = new CompressionStream('gzip');
+                const writer = cs.writable.getWriter();
+                writer.write(new TextEncoder().encode(str));
+                writer.close();
+                const buf = await new Response(cs.readable).arrayBuffer();
+                const b64 = cloudBytesToBase64(new Uint8Array(buf));
+                return (b64.length < str.length) ? { data: b64, compressed: true } : { data: str, compressed: false };
+            } catch (e) { return { data: str, compressed: false }; }
+        }
+        async function cloudDecompress(b64) {
+            try {
+                const ds = new DecompressionStream('gzip');
+                const writer = ds.writable.getWriter();
+                writer.write(cloudBase64ToBytes(b64));
+                writer.close();
+                const buf = await new Response(ds.readable).arrayBuffer();
+                return new TextDecoder().decode(buf);
+            } catch (e) { return null; }
+        }
 
         // Strips embedded <img> markup (the one thing that can make a note huge)
         // so the rest of its text/metadata has a real shot at fitting the cloud
@@ -8714,65 +8798,161 @@ window.mu_syncHtmlBg = function(){
                     text: persisted.text, html: cloudStripImages(persisted.html),
                     encrypted: persisted.encrypted, hint: persisted.hint,
                     tags: persisted.tags, pinned: persisted.pinned, favorite: persisted.favorite,
+                    // Bug fix: `archived` used to be missing here even though cloudRestore
+                    // reads cloudItem.archived when merging — so any archived note that got
+                    // backed up and later restored (here or on another device) had its
+                    // archived flag silently wiped back to false. order/fontFamily/fontSize/
+                    // titleHistory were dropped the same way, resetting sort position,
+                    // appearance and rename history on restore. All now carried over.
+                    archived: persisted.archived, order: persisted.order,
+                    fontFamily: persisted.fontFamily, fontSize: persisted.fontSize,
+                    titleHistory: persisted.titleHistory,
                     lastEdited: persisted.lastEdited
                 };
             });
             const totalNotes = included.length;
             const customFolders = folders.filter(f => f !== DEFAULT_FOLDER);
             let skipped = 0;
-            let json = JSON.stringify({ v: 1, ts: Date.now(), folders: customFolders, notes: included });
-            const budget = CLOUD_CHUNK_SIZE * 900; // stay well under Telegram's 1024-key ceiling
-            while (json.length > budget && included.length > 1) {
-                included = included.slice(0, -1);
-                skipped++;
-                json = JSON.stringify({ v: 1, ts: Date.now(), folders: customFolders, notes: included });
+            const budget = CLOUD_CHUNK_SIZE * MAX_CHUNKS_PER_BACKUP; // stay under one backup slot's key budget
+
+            const pack = async (list) => {
+                const raw = JSON.stringify({ v: 1, ts: Date.now(), folders: customFolders, notes: list });
+                return { raw, ...(await cloudCompress(raw)) };
+            };
+
+            let packed = await pack(included);
+            // Compression means the real (post-gzip) size can only be known
+            // after packing, so trimming is iterative: cut a bite out of the
+            // note list, re-pack, check again — proportional to how far over
+            // budget we still are, so this converges in only a few rounds
+            // even for a very large note collection.
+            let guard = 0;
+            while (packed.data.length > budget && included.length > 1 && guard < 40) {
+                const overRatio = packed.data.length / budget;
+                const cut = Math.max(1, Math.floor(included.length * Math.min(0.4, (overRatio - 1) * 0.6)));
+                included = included.slice(0, -cut);
+                skipped += cut;
+                packed = await pack(included);
+                guard++;
             }
-            return { json, skipped, totalNotes };
+            return { data: packed.data, compressed: packed.compressed, skipped, totalNotes };
+        }
+
+        // Reads the `mk_idx` list of backup entries ({id, kind, ts, notes,
+        // skipped, chunks}), migrating a pre-upgrade single backup (the old
+        // `mk_meta` + `mk_c{n}` keys) into it the first time this runs so
+        // nobody's existing Telegram Cloud backup is stranded or lost.
+        async function cloudReadIndex() {
+            const raw = await cloudGetItem(CLOUD_INDEX_KEY);
+            const idx = raw ? safeParseJSON(raw, null) : null;
+            if (Array.isArray(idx)) return idx;
+            const legacyMetaRaw = await cloudGetItem(CLOUD_META_KEY);
+            const legacyMeta = legacyMetaRaw ? safeParseJSON(legacyMetaRaw, null) : null;
+            if (!legacyMeta || !legacyMeta.n) { await cloudSetItem(CLOUD_INDEX_KEY, '[]'); return []; }
+            const oldKeys = []; for (let i = 0; i < legacyMeta.n; i++) oldKeys.push(CLOUD_CHUNK_PREFIX + i);
+            const parts = await cloudGetItems(oldKeys);
+            const newKeys = cloudBackupChunkKeys('auto', legacyMeta.n);
+            for (let i = 0; i < legacyMeta.n; i++) await cloudSetItem(newKeys[i], parts[oldKeys[i]] || '');
+            await cloudRemoveItems(oldKeys.concat([CLOUD_META_KEY]));
+            const migrated = [{ id: 'auto', kind: 'auto', ts: legacyMeta.ts, notes: legacyMeta.notes, skipped: legacyMeta.skipped || 0, chunks: legacyMeta.n }];
+            await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(migrated));
+            return migrated;
+        }
+
+        // Newest-first list of every backup (the one auto slot, plus up to
+        // MAX_MANUAL_BACKUPS manual snapshots) — what the Cloud Backup panel
+        // renders.
+        async function cloudListBackups() {
+            const idx = await cloudReadIndex();
+            return idx.slice().sort((a, b) => (b.ts || 0) - (a.ts || 0));
         }
 
         let __cloudBackupTimer = null;
         function scheduleCloudBackup() {
             if (!IS_TELEGRAM || !hasCloudStorage) return;
             clearTimeout(__cloudBackupTimer);
-            __cloudBackupTimer = setTimeout(() => { cloudBackupNow().catch(e => console.warn('Cloud backup failed', e)); }, 3000);
+            __cloudBackupTimer = setTimeout(() => { cloudBackupNow('auto').catch(e => console.warn('Cloud backup failed', e)); }, 3000);
         }
 
-        async function cloudBackupNow() {
+        // kind: 'auto' (default — silently overwrites the single auto slot)
+        // or 'manual' (creates a new, separately-kept snapshot; oldest manual
+        // snapshots beyond MAX_MANUAL_BACKUPS are pruned automatically).
+        // kind: 'auto' (default — silently overwrites the single auto slot)
+        // or 'manual' (creates a new, separately-kept snapshot; oldest manual
+        // snapshots beyond MAX_MANUAL_BACKUPS are pruned automatically).
+        // label: optional short text the person typed in for a manual
+        // snapshot, so several saved backups stay identifiable at a glance.
+        async function cloudBackupNow(kind, label) {
+            kind = (kind === 'manual') ? 'manual' : 'auto';
             if (!hasCloudStorage) return { ok: false, reason: 'unavailable' };
-            const { json, skipped, totalNotes } = await cloudBuildPayload();
+            const { data, compressed, skipped, totalNotes } = await cloudBuildPayload();
             const chunks = [];
-            for (let i = 0; i < json.length; i += CLOUD_CHUNK_SIZE) chunks.push(json.slice(i, i + CLOUD_CHUNK_SIZE));
+            for (let i = 0; i < data.length; i += CLOUD_CHUNK_SIZE) chunks.push(data.slice(i, i + CLOUD_CHUNK_SIZE));
 
-            const prevMetaRaw = await cloudGetItem(CLOUD_META_KEY);
-            const prevMeta = prevMetaRaw ? safeParseJSON(prevMetaRaw, null) : null;
-            const prevCount = (prevMeta && prevMeta.n) || 0;
+            const idx = await cloudReadIndex();
+            const id = kind === 'auto' ? 'auto' : ('m' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5));
+            const prevEntry = idx.find(e => e.id === id);
+            const prevChunkCount = prevEntry ? (prevEntry.chunks || 0) : 0;
 
+            const keys = cloudBackupChunkKeys(id, chunks.length);
             for (let i = 0; i < chunks.length; i++) {
-                const ok = await cloudSetItem(CLOUD_CHUNK_PREFIX + i, chunks[i]);
+                const ok = await cloudSetItem(keys[i], chunks[i]);
                 if (!ok) return { ok: false, reason: 'write-failed' };
             }
-            // Clean up leftover chunk keys from a previous, larger backup.
-            if (prevCount > chunks.length) {
-                const stale = [];
-                for (let i = chunks.length; i < prevCount; i++) stale.push(CLOUD_CHUNK_PREFIX + i);
-                await cloudRemoveItems(stale);
+            // Clean up leftover chunk keys from a previous, larger version of
+            // this same slot (only relevant for the 'auto' id, which is reused).
+            if (prevChunkCount > chunks.length) {
+                await cloudRemoveItems(cloudBackupChunkKeys(id, prevChunkCount).slice(chunks.length));
             }
-            const meta = { n: chunks.length, ts: Date.now(), notes: totalNotes - skipped, skipped };
-            await cloudSetItem(CLOUD_META_KEY, JSON.stringify(meta));
-            return { ok: true, meta };
+
+            const cleanLabel = kind === 'manual' ? String(label || '').trim().slice(0, CLOUD_LABEL_MAX_LEN) : '';
+            const entry = { id, kind, ts: Date.now(), notes: totalNotes - skipped, skipped, chunks: chunks.length, c: compressed ? 1 : 0, label: cleanLabel };
+            let nextIdx = idx.filter(e => e.id !== id);
+            nextIdx.push(entry);
+
+            if (kind === 'manual') {
+                // Keep only the newest MAX_MANUAL_BACKUPS manual snapshots — older
+                // ones (and their chunk keys) are removed to stay under the
+                // shared Telegram Cloud key budget.
+                const manuals = nextIdx.filter(e => e.kind === 'manual').sort((a, b) => (b.ts || 0) - (a.ts || 0));
+                const overflow = manuals.slice(MAX_MANUAL_BACKUPS);
+                if (overflow.length) {
+                    for (const old of overflow) await cloudRemoveItems(cloudBackupChunkKeys(old.id, old.chunks));
+                    const overflowIds = new Set(overflow.map(e => e.id));
+                    nextIdx = nextIdx.filter(e => !overflowIds.has(e.id));
+                }
+            }
+            await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(nextIdx));
+            return { ok: true, meta: entry };
         }
 
-        async function cloudRestore() {
+        // Fetches and parses one specific backup's full payload by id (used
+        // for both "Restore" and "View"). Decompresses first when the entry
+        // says its payload was stored gzip-compressed (`c: 1`).
+        async function cloudRestoreBackup(id) {
             if (!hasCloudStorage) return null;
-            const metaRaw = await cloudGetItem(CLOUD_META_KEY);
-            const meta = metaRaw ? safeParseJSON(metaRaw, null) : null;
-            if (!meta || !meta.n) return null;
-            const keys = []; for (let i = 0; i < meta.n; i++) keys.push(CLOUD_CHUNK_PREFIX + i);
+            const idx = await cloudReadIndex();
+            const entry = idx.find(e => e.id === id);
+            if (!entry || !entry.chunks) return null;
+            const keys = cloudBackupChunkKeys(id, entry.chunks);
             const parts = await cloudGetItems(keys);
-            const json = keys.map(k => parts[k] || '').join('');
+            const raw = keys.map(k => parts[k] || '').join('');
+            const json = entry.c ? await cloudDecompress(raw) : raw;
+            if (json == null) return null;
             const data = safeParseJSON(json, null);
             if (!data || !Array.isArray(data.notes)) return null;
-            return { meta, data };
+            return { meta: entry, data };
+        }
+
+        // Deletes one manual backup snapshot (its chunk keys + its index entry).
+        async function cloudDeleteBackup(id) {
+            if (!hasCloudStorage) return false;
+            const idx = await cloudReadIndex();
+            const entry = idx.find(e => e.id === id);
+            if (!entry) return true;
+            await cloudRemoveItems(cloudBackupChunkKeys(id, entry.chunks));
+            await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(idx.filter(e => e.id !== id)));
+            return true;
         }
 
         const i18n = {
@@ -9476,6 +9656,7 @@ window.mu_syncHtmlBg = function(){
                     el.src = url;
                     el.dataset.muHydratedFor = mediaId;
                     el.dataset.muObjectUrl = url;
+                    if (el.tagName === 'AUDIO' && typeof mu_fixAudioDuration === 'function') mu_fixAudioDuration(el);
                     if (oldUrl && oldUrl !== url) { try { URL.revokeObjectURL(oldUrl); } catch (_) {} }
                 }
             }
@@ -10271,6 +10452,7 @@ window.mu_syncHtmlBg = function(){
             if(document.getElementById('btnRandomPortal')) document.getElementById('btnRandomPortal').innerText=currentLang==='fa'?'🌀 پورتال رندوم':'🌀 Random Portal';
             if(document.getElementById('btnMorseCode')) document.getElementById('btnMorseCode').innerText=currentLang==='fa'?'📡 کد مورس':'📡 Morse Code';
             if(document.getElementById('btnBinaryCode')) document.getElementById('btnBinaryCode').innerText=currentLang==='fa'?'🔢 کد باینری':'🔢 Binary Code';
+            if(document.getElementById('btnTelegramCloudBackup')) document.getElementById('btnTelegramCloudBackup').innerText=currentLang==='fa'?'☁️ بکاپ Cloud تلگرام':'☁️ Telegram Cloud Backup';
             if(document.getElementById('btnSmartSearch')) document.getElementById('btnSmartSearch').innerText=currentLang==='fa'?'جستجو':'Search';
             if(document.getElementById('markhinGameLaunchBtn')) document.getElementById('markhinGameLaunchBtn').title=currentLang==='fa'?'منطقه بازی':'Game Zone';
             if(document.getElementById('markhinGameLaunchLabel')) document.getElementById('markhinGameLaunchLabel').innerText=currentLang==='fa'?'منطقه بازی':'Game Zone';
@@ -10956,6 +11138,40 @@ window.mu_syncHtmlBg = function(){
             }
         }
 
+        // Bug fix: audio recorded via MediaRecorder is a WebM/Opus (or similar)
+        // stream whose container header never gets a real duration written into
+        // it — the browser only finds out how long the clip actually is by
+        // reading all the way through it. Until then, Chromium-based browsers
+        // report audioEl.duration as Infinity or some other bogus, way-too-large
+        // number, which is exactly why a 1-second voice note could show up
+        // looking like it's "several hours" or "several minutes" long. The fix
+        // (standard workaround, no library needed) is to seek near the very end
+        // once metadata loads — that forces the browser to walk the whole file
+        // and compute the real duration — then jump the playhead back to 0.
+        // Applied both right after recording (insertAudioToNote) and whenever a
+        // saved voice note is hydrated back into a note (hydrateMedia), since
+        // both are places an <audio> element's src gets (re)assigned.
+        function mu_fixAudioDuration(audioEl) {
+            if (!audioEl) return;
+            const tryFix = () => {
+                if (audioEl.duration === Infinity || isNaN(audioEl.duration)) {
+                    const onTimeUpdate = () => {
+                        audioEl.removeEventListener('timeupdate', onTimeUpdate);
+                        audioEl.currentTime = 0;
+                    };
+                    audioEl.addEventListener('timeupdate', onTimeUpdate);
+                    audioEl.currentTime = 1e101;
+                } else {
+                    audioEl.dataset.muDurationFixed = '1';
+                }
+            };
+            if (audioEl.readyState >= 1) {
+                tryFix();
+            } else {
+                audioEl.addEventListener('loadedmetadata', tryFix, { once: true });
+            }
+        }
+
         function insertAudioToNote(id, audioSrc, mediaId) {
             const textBox = document.getElementById(`text-${id}`);
             if (!textBox) return;
@@ -10968,6 +11184,7 @@ window.mu_syncHtmlBg = function(){
             audioEl.controls = true;
             audioEl.src = audioSrc;
             if (mediaId) audioEl.dataset.muMedia = mediaId;
+            mu_fixAudioDuration(audioEl);
 
             const delBtn = document.createElement('button');
             delBtn.className = 'img-btn';
@@ -15875,7 +16092,26 @@ window.mdToHtml = mdToHtml;
 function htmlToMd(html){const d=document.createElement('div');d.innerHTML=sanitizeHtml(html||'');d.querySelectorAll('br').forEach(x=>x.replaceWith('\n'));d.querySelectorAll('strong,b').forEach(x=>x.replaceWith('**'+x.textContent+'**'));d.querySelectorAll('em,i').forEach(x=>x.replaceWith('*'+x.textContent+'*'));d.querySelectorAll('u').forEach(x=>x.replaceWith('__'+x.textContent+'__'));d.querySelectorAll('blockquote').forEach(x=>x.replaceWith('\n> '+x.textContent+'\n'));d.querySelectorAll('li').forEach(x=>x.replaceWith('- '+x.textContent+'\n'));d.querySelectorAll('a').forEach(x=>x.replaceWith('['+x.textContent+']('+x.getAttribute('href')+')'));return (d.innerText||d.textContent||'').replace(/\n{3,}/g,'\n\n').trim();}
 function addFeatureTools(item,box){
  const text=document.getElementById('text-'+item.id); if(!text)return; ensureItem(item);
- const tools=box.querySelector('.note-tools'); if(!tools||tools.dataset.features==='1')return;tools.dataset.features='1';
+ const tools=box.querySelector('.note-tools'); if(!tools)return;
+ // Bug fix: the voice-record button's icon/title/highlight used to be baked
+ // into undoRedoRow's HTML only once, the first time this function built the
+ // row (guarded by tools.dataset.features==='1' below). Every later call —
+ // including the ones toggleAudioRecording() triggers via renderContents()
+ // right after starting/stopping the recorder — hit that guard and returned
+ // before ever touching the button again, so clicking 🎙️ started recording
+ // but the icon just sat there and never flipped to ⏹️. Now we look the
+ // button up by id and resync it on every call, before the early return.
+ {
+     const t0 = i18n[currentLang];
+     const isRecordingNow = (activeRecId === item.id);
+     const recBtn = document.getElementById('mu-rec-' + item.id);
+     if (recBtn) {
+         recBtn.title = isRecordingNow ? t0.stopAudio : t0.recAudio;
+         recBtn.style.cssText = isRecordingNow ? 'background:rgba(239,68,68,0.75);color:#fff;' : '';
+         recBtn.textContent = isRecordingNow ? '⏹️' : '🎙️';
+     }
+ }
+ if(tools.dataset.features==='1')return;tools.dataset.features='1';
  // Baseline checkpoint for the robust undo/redo history (see mu_historyInit),
  // captured once per note-open before any edits happen this session.
  mu_historyInit(item.id, text.innerHTML);
@@ -15936,7 +16172,7 @@ function addFeatureTools(item,box){
  // (see the CSS comment by .markhin-undo-redo-row) instead of the old
  // full-width bars, so the whole row reads as one line of small buttons.
  const undoRedoRow=document.createElement('div');undoRedoRow.className='markhin-undo-redo-row';
- undoRedoRow.innerHTML=`<button type="button" class="img-btn" title="${fa?'حذف متن یادداشت':'Delete note text'}" onclick="clearNoteText('${item.id}')">🗑️</button><button type="button" class="img-btn" title="${fa?'کپی متن':'Copy text'}" onclick="copyCategory('${item.id}')">📋</button><button type="button" id="mu-undo-${item.id}" class="img-btn mu-undo-redo-btn" title="${fa?'واگرد (بازگشت به مرحله قبل)':'Undo (step back)'}">↩️</button><button type="button" id="mu-redo-${item.id}" class="img-btn mu-undo-redo-btn" title="${fa?'ازنو (رفتن به مرحله بعد)':'Redo (step forward)'}">↪️</button><button type="button" class="img-btn" title="${t.draw}" onclick="toggleDrawingBox('${item.id}')">🎨</button><button type="button" class="img-btn" title="${isRecordingThis ? t.stopAudio : t.recAudio}" style="${isRecordingThis ? 'background:rgba(239,68,68,0.75);color:#fff;' : ''}" onclick="toggleAudioRecording('${item.id}')">${isRecordingThis ? '⏹️' : '🎙️'}</button><button type="button" class="img-btn" title="${t.addImage}" onclick="triggerImageUpload('${item.id}')">🖼️</button><button type="button" class="img-btn" onclick="shareNote('${item.id}')">📤 ${fa?'اشتراک':'Share'}</button><input type="file" id="img-input-${item.id}" style="display:none" accept="image/*" onchange="insertImageToText('${item.id}', event)">`;
+ undoRedoRow.innerHTML=`<button type="button" class="img-btn" title="${fa?'حذف متن یادداشت':'Delete note text'}" onclick="clearNoteText('${item.id}')">🗑️</button><button type="button" class="img-btn" title="${fa?'کپی متن':'Copy text'}" onclick="copyCategory('${item.id}')">📋</button><button type="button" id="mu-undo-${item.id}" class="img-btn mu-undo-redo-btn" title="${fa?'واگرد (بازگشت به مرحله قبل)':'Undo (step back)'}">↩️</button><button type="button" id="mu-redo-${item.id}" class="img-btn mu-undo-redo-btn" title="${fa?'ازنو (رفتن به مرحله بعد)':'Redo (step forward)'}">↪️</button><button type="button" class="img-btn" title="${t.draw}" onclick="toggleDrawingBox('${item.id}')">🎨</button><button type="button" id="mu-rec-${item.id}" class="img-btn" title="${isRecordingThis ? t.stopAudio : t.recAudio}" style="${isRecordingThis ? 'background:rgba(239,68,68,0.75);color:#fff;' : ''}" onclick="toggleAudioRecording('${item.id}')">${isRecordingThis ? '⏹️' : '🎙️'}</button><button type="button" class="img-btn" title="${t.addImage}" onclick="triggerImageUpload('${item.id}')">🖼️</button><button type="button" class="img-btn" onclick="shareNote('${item.id}')">📤 ${fa?'اشتراک':'Share'}</button><input type="file" id="img-input-${item.id}" style="display:none" accept="image/*" onchange="insertImageToText('${item.id}', event)">`;
  undoRedoRow.querySelector('#mu-undo-'+item.id).onclick=()=>mu_undoText(item.id);
  undoRedoRow.querySelector('#mu-redo-'+item.id).onclick=()=>mu_redoText(item.id);
  text.parentNode.insertBefore(undoRedoRow,insertPoint);
@@ -16402,9 +16638,10 @@ window.addTopControls = addTopControls;
    needs to happen here at DOMContentLoaded time anymore.*/
 /* =========================================================================
    MU_Dashboard — ماژول داشبورد (آمار/میانبرها/فهرست‌های فیلترشده) +
-   پنل بکاپ Cloud تلگرام (که از همان صفحه‌ی داشبورد باز می‌شود و
-   markhinDash_headHtml مشترک را با آن به اشتراک می‌گذارد، برای همین
-   دو تا با هم داخل یک ماژول‌اند، نه دوتا جدا).
+   پنل بکاپ Cloud تلگرام (که حالا دکمه‌ی بازکردنش در بخش «ابزارهای
+   ویژه» است، نه داخل صفحه‌ی داشبورد، ولی همچنان markhinDash_headHtml
+   مشترک را با داشبورد به اشتراک می‌گذارد، برای همین دو تا با هم داخل
+   یک ماژول‌اند، نه دوتا جدا).
 
    مثل MU_Theme/MU_AIProvider: closure خصوصی خودش را دارد؛ همه‌ی
    کمکی‌های داخلی (markhinDash_notes/noteRowHtml/bindRows/headHtml/...)
@@ -16576,7 +16813,6 @@ function markhinDashboardMain(){
         `<div class="markhin-dashboard-grid">${heroGrid}</div>`+
         `<p class="dna-section-title" style="margin-top:16px">${fa?'میانبرها':'Quick filters'}</p>`+
         `<div class="markhin-dashboard-grid">${actionGrid}</div>`+
-        (IS_TELEGRAM && hasCloudStorage ? `<div style="margin-top:16px"><button class="btn-main" style="width:100%" onclick="markhinDash_showCloudPanel()">☁️ ${fa?'بکاپ Cloud تلگرام':'Telegram Cloud Backup'}</button></div>` : '')+
         `<p class="dna-section-title" style="margin-top:16px">${fa?'ابر تگ‌ها — روی هرکدام بزن':'Tag cloud — tap to filter'}</p>`+
         `<div class="markhin-tag-cloud">${tagCloudHtml}</div>`+
         (recent.length?`<p class="dna-section-title" style="margin-top:16px">${fa?'اخیراً ویرایش‌شده':'Recently edited'}</p><div class="markhin-smart-results">${recentHtml}</div>`:'')+
@@ -16589,49 +16825,226 @@ window.markhinDashboardMain=markhinDashboardMain;
 window.openMarkhinDashboard=function(){ markhinDashboardMain(); };
 
 /* ============== Telegram Cloud Backup panel ============== */
+function mu_fmtCloudDate(ts){
+    const fa=currentLang==='fa';
+    try { return new Date(ts).toLocaleString(fa?'fa-IR':undefined); } catch(e){ return String(ts); }
+}
+
+function mu_cloudBackupRowHtml(e, opts){
+    opts=opts||{};
+    const fa=currentLang==='fa';
+    const label = e.kind==='auto'
+        ? (fa?'🔄 آخرین وضعیت (خودکار)':'🔄 Latest state (auto)')
+        : (e.label ? `📌 ${escapeHtml(e.label)}` : `📌 ${mu_fmtCloudDate(e.ts)}`);
+    // Upgrade: rough size estimate (chunks × chunk size) next to the note count,
+    // so it's visible at a glance how much of a backup slot's budget is used —
+    // ties into the size limits now spelled out in the Help panel.
+    const sizeKB = Math.max(1, Math.round(((e.chunks||0) * CLOUD_CHUNK_SIZE) / 1000));
+    const sub = `${mu_fmtCloudDate(e.ts)} · ${e.notes} ${fa?'یادداشت':'notes'} · ~${sizeKB} ${fa?'کیلوبایت':'KB'}${e.skipped?` · ⚠️ ${e.skipped} ${fa?'رد شد':'skipped'}`:''}`;
+    const delBtn = opts.allowDelete ? `<button type="button" class="btn-main" data-cloud-action="delete">🗑 ${fa?'حذف':'Delete'}</button>` : '';
+    return `<div class="markhin-smart-item" data-backup-id="${escapeHtml(e.id)}" style="margin-bottom:8px">
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
+            <b style="min-width:0">${label}</b>
+        </div>
+        <div class="snippet">${sub}</div>
+        <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
+            <button type="button" class="btn-main" data-cloud-action="view">👁 ${fa?'مشاهده':'View'}</button>
+            <button type="button" class="btn-main" data-cloud-action="restore">📥 ${fa?'بازیابی':'Restore'}</button>
+            ${delBtn}
+        </div>
+    </div>`;
+}
+
 async function markhinDash_showCloudPanel(){
     const fa=currentLang==='fa';
     showAdvanced(markhinDash_headHtml(`☁️ ${fa?'بکاپ Cloud تلگرام':'Telegram Cloud Backup'}`,true)+
         `<div id="cloudPanelBody" style="font-size:12.5px;line-height:1.9">${fa?'در حال بررسی...':'Checking...'}</div>`);
-    const metaRaw = await cloudGetItem(CLOUD_META_KEY);
-    const meta = metaRaw ? safeParseJSON(metaRaw, null) : null;
-    const body = document.getElementById('cloudPanelBody');
-    if (!body) return;
-    const info = meta
-        ? (fa ? `آخرین بکاپ: ${new Date(meta.ts).toLocaleString('fa-IR')}<br>یادداشت‌های پشتیبان‌گیری‌شده: ${meta.notes}${meta.skipped?` (⚠️ ${meta.skipped} یادداشت به‌دلیل محدودیت فضا رد شد)`:''}`
-             : `Last backup: ${new Date(meta.ts).toLocaleString()}<br>Notes backed up: ${meta.notes}${meta.skipped?` (⚠️ ${meta.skipped} skipped — over the size limit)`:''}`)
-        : (fa ? 'هنوز هیچ بکاپی در Cloud تلگرام ثبت نشده.' : 'No cloud backup yet.');
-    body.innerHTML = `<p>${info}</p>` +
-        `<p style="opacity:.7">${fa?'⚠️ فقط متن و اطلاعات یادداشت‌ها بکاپ می‌شود؛ تصاویر فقط روی همین دستگاه می‌مانند و در بکاپ نیستند. این بکاپ بین همه‌ی دستگاه‌هایی که همین ربات را در تلگرام باز کنی مشترک است.':'⚠️ Only note text/metadata is backed up here — images stay on this device and are not included. This backup is shared across every device where you open this bot in Telegram.'}</p>` +
-        `<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">` +
-        `<button class="btn-main btn-save-prominent" onclick="markhinDash_cloudBackupClick()">📤 ${fa?'بکاپ الان':'Backup now'}</button>` +
-        `<button class="btn-main" onclick="markhinDash_cloudRestoreClick()" ${meta?'':'disabled'}>📥 ${fa?'بازیابی از Cloud':'Restore from cloud'}</button>` +
-        `</div>`;
+    await markhinDash_renderCloudPanelBody();
 }
 window.markhinDash_showCloudPanel = markhinDash_showCloudPanel;
 
+// Renders/refreshes the panel's body in place (list of backups + actions)
+// without re-opening the modal — used on first open and after every
+// backup/delete so the list always reflects what's actually in the cloud.
+async function markhinDash_renderCloudPanelBody(){
+    const fa=currentLang==='fa';
+    const body = document.getElementById('cloudPanelBody');
+    if (!body) return;
+    const list = await cloudListBackups();
+    const autoEntry = list.find(e=>e.kind==='auto');
+    const manualEntries = list.filter(e=>e.kind==='manual');
+
+    const autoSectionHtml = autoEntry
+        ? mu_cloudBackupRowHtml(autoEntry, {allowDelete:false})
+        : `<div class="markhin-smart-empty">${fa?'هنوز هیچ بکاپ خودکاری ثبت نشده.':'No auto backup yet.'}</div>`;
+    const manualSectionHtml = manualEntries.length
+        ? manualEntries.map(e=>mu_cloudBackupRowHtml(e,{allowDelete:true})).join('')
+        : `<div class="markhin-smart-empty">${fa?'هنوز بکاپ دستی‌ای ذخیره نکرده‌ای.':'No manual backups saved yet.'}</div>`;
+
+    body.innerHTML =
+        `<div style="margin:0 0 10px"><button type="button" class="btn-main" style="width:100%" onclick="markhinDash_showCloudHelp()">❓ ${fa?'راهنما و طرز استفاده':'Help & how to use'}</button></div>` +
+        `<p style="opacity:.7">${fa?'⚠️ فقط متن و اطلاعات یادداشت‌ها بکاپ می‌شود؛ تصاویر فقط روی همین دستگاه می‌مانند و در بکاپ نیستند. این بکاپ بین همه‌ی دستگاه‌هایی که همین ربات را در تلگرام باز کنی مشترک است.':'⚠️ Only note text/metadata is backed up here — images stay on this device and are not included. This backup is shared across every device where you open this bot in Telegram.'}</p>` +
+        `<input id="cloudBackupLabelInput" type="text" maxlength="${CLOUD_LABEL_MAX_LEN}" placeholder="${fa?'برچسب اختیاری (مثلاً «قبل از پاکسازی پوشه‌ی کار»)…':'Optional label (e.g. "before clearing the work folder")…'}" style="width:100%;box-sizing:border-box;margin:4px 0 8px;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:inherit;font-size:12.5px">` +
+        (manualEntries.length >= MAX_MANUAL_BACKUPS
+            ? `<p style="opacity:.7;margin:0 0 8px">${fa?`ℹ️ به سقف ${MAX_MANUAL_BACKUPS} بکاپ دستی رسیده‌ای؛ ذخیره‌ی یک بکاپ جدید، قدیمی‌ترینشان را خودکار حذف می‌کند.`:`ℹ️ You're at the ${MAX_MANUAL_BACKUPS}-backup limit; saving a new one will automatically remove the oldest.`}</p>`
+            : '') +
+        `<div style="margin:2px 0 10px"><button id="cloudBackupBtn" type="button" class="btn-main btn-save-prominent" style="width:100%" onclick="markhinDash_cloudBackupClick()">📤 ${fa?'ذخیره‌ی یک بکاپ جدید':'Save a new backup'}</button></div>` +
+        `<h4 style="margin:16px 0 6px;font-size:12.5px;opacity:.85">${fa?'وضعیت خودکار':'Auto state'}</h4>` +
+        autoSectionHtml +
+        `<h4 style="margin:16px 0 6px;font-size:12.5px;opacity:.85">${fa?`بکاپ‌های ذخیره‌شده (${manualEntries.length} از ${MAX_MANUAL_BACKUPS})`:`Saved backups (${manualEntries.length} of ${MAX_MANUAL_BACKUPS})`}</h4>` +
+        manualSectionHtml;
+
+    body.querySelectorAll('[data-backup-id]').forEach(row=>{
+        const id = row.dataset.backupId;
+        row.querySelectorAll('[data-cloud-action]').forEach(btn=>{
+            const action = btn.dataset.cloudAction;
+            btn.onclick = (e)=>{
+                e.stopPropagation();
+                if (action==='view') markhinDash_cloudViewBackup(id);
+                else if (action==='restore') markhinDash_cloudRestoreClick(id);
+                else if (action==='delete') markhinDash_cloudDeleteClick(id);
+            };
+        });
+    });
+}
+
+// Explains what auto/manual backups are and how view/restore/delete work —
+// opened from the "❓ Help" button at the top of the Cloud Backup panel.
+function markhinDash_showCloudHelp(){
+    const fa=currentLang==='fa';
+    const bodyHtml = fa ? `
+        <div style="font-size:12.5px;line-height:2">
+            <h4 style="margin:0 0 6px">🔄 وضعیت خودکار</h4>
+            <p>هر بار یادداشتی را ویرایش می‌کنی، چند ثانیه بعد برنامه به‌صورت خودکار و بی‌صدا آخرین وضعیت متن یادداشت‌هایت را در Cloud تلگرام ذخیره می‌کند. این فقط یک جایگاه است که هر بار جای نسخه‌ی قبلی‌اش را می‌گیرد — یک شبکه‌ی ایمنی است، نه یک تاریخچه؛ نیازی به کاری از طرف تو ندارد.</p>
+            <h4 style="margin:14px 0 6px">📤 ذخیره‌ی یک بکاپ جدید</h4>
+            <p>با زدن این دکمه، یک نسخه‌ی مجزا و ثابت از وضعیت فعلی یادداشت‌هایت ساخته می‌شود که تا وقتی خودت حذفش نکنی دست‌نخورده باقی می‌ماند. می‌توانی برایش یک برچسب کوتاه هم بنویسی (مثلاً «قبل از پاکسازی پوشه‌ی کار») تا در لیست راحت‌تر شناخته شود؛ اگر چیزی ننویسی، فقط تاریخ نشان داده می‌شود. تا ${MAX_MANUAL_BACKUPS} بکاپ دستی می‌توانی هم‌زمان نگه داری؛ وقتی یکی بیشتر بسازی، قدیمی‌ترینشان خودکار حذف می‌شود.</p>
+            <h4 style="margin:14px 0 6px">👁 مشاهده</h4>
+            <p>قبل از بازیابی، می‌توانی فهرست عنوان یادداشت‌های داخل هر بکاپ را ببینی تا مطمئن شوی همان نسخه‌ای است که می‌خواهی — بدون این‌که چیزی تغییر کند.</p>
+            <h4 style="margin:14px 0 6px">📥 بازیابی</h4>
+            <p>یادداشت‌هایی که همین‌جا هم با همان شناسه وجود دارند، فقط در صورتی از روی بکاپ به‌روزرسانی می‌شوند که نسخه‌ی بکاپ جدیدتر باشد؛ تصاویرشان دست‌نخورده می‌ماند. یادداشت‌های تازه از بکاپ اضافه می‌شوند. همیشه قبل از بازیابی یک تأییدیه از تو گرفته می‌شود.</p>
+            <h4 style="margin:14px 0 6px">🗑 حذف</h4>
+            <p>فقط بکاپ‌های دستی قابل حذف‌اند. وضعیت خودکار همیشه باقی می‌ماند چون خودش به‌طور مداوم مدیریت و جایگزین می‌شود.</p>
+            <h4 style="margin:14px 0 6px">🗜️ فشرده‌سازی</h4>
+            <p>روی مرورگرهایی که پشتیبانی می‌کنند، محتوای هر بکاپ قبل از ذخیره فشرده می‌شود تا چندین برابر یادداشت بیشتری در همان فضای محدود Cloud تلگرام جا شود. این کار کاملاً خودکار و پشت‌صحنه است؛ اگر مرورگری از آن پشتیبانی نکند، بدون هیچ مشکلی به همان روش قدیمی (بدون فشرده‌سازی) ذخیره می‌شود.</p>
+            <h4 style="margin:14px 0 6px">⚠️ محدودیت‌ها</h4>
+            <p>فقط متن و اطلاعات یادداشت‌ها بکاپ می‌شود — تصاویر همیشه فقط روی همان دستگاهی می‌مانند که در آن ذخیره شده‌اند. چون این بکاپ‌ها در فضای ابری خود تلگرام (نه روی این دستگاه) نگه‌داری می‌شوند، بین هر دستگاهی که همین ربات تلگرام را با همین حساب باز کنی مشترک‌اند.</p>
+            <p>این قابلیت به هیچ سرور جداگانه‌ای وابسته نیست؛ کاملاً روی زیرساخت خودِ تلگرام (Telegram Cloud Storage) کار می‌کند. به همین دلیل چند محدودیت فنی هم از طرف خودِ تلگرام روی آن اعمال می‌شود: هر مقدار ذخیره‌شده حداکثر ۴۰۹۶ کاراکتر می‌تواند باشد (به همین خاطر بکاپ‌های بزرگ‌تر خودکار به چند قطعه تقسیم می‌شوند)، و کل تعداد کلیدهای ذخیره‌شده (یک اسلات خودکار به‌علاوه‌ی حداکثر ${MAX_MANUAL_BACKUPS} بکاپ دستی) همیشه با فاصله‌ی امن از سقف ۱۰۲۴ کلیدیِ تلگرام نگه داشته می‌شود.</p>
+        </div>`
+    : `
+        <div style="font-size:12.5px;line-height:2">
+            <h4 style="margin:0 0 6px">🔄 Auto state</h4>
+            <p>A few seconds after every edit, the app silently saves the latest state of your notes' text to Telegram Cloud. This is a single slot that gets overwritten each time — a safety net, not a history. Nothing to do on your part.</p>
+            <h4 style="margin:14px 0 6px">📤 Save a new backup</h4>
+            <p>Creates a separate, fixed snapshot of your notes right now, kept untouched until you delete it. You can give it a short label (e.g. "before clearing the work folder") so it's easy to recognize in the list; leave it blank and only the date is shown. Up to ${MAX_MANUAL_BACKUPS} manual backups can exist at once; saving one more automatically removes the oldest.</p>
+            <h4 style="margin:14px 0 6px">👁 View</h4>
+            <p>Before restoring, see the list of note titles inside any backup to confirm it's the version you want — nothing changes just by viewing.</p>
+            <h4 style="margin:14px 0 6px">📥 Restore</h4>
+            <p>Notes that already exist here (same id) are only updated if the backup copy is newer; their images are left untouched. New notes from the backup are added. You're always asked to confirm before anything happens.</p>
+            <h4 style="margin:14px 0 6px">🗑 Delete</h4>
+            <p>Only manual backups can be deleted. The auto state always stays, since it manages and replaces itself automatically.</p>
+            <h4 style="margin:14px 0 6px">🗜️ Compression</h4>
+            <p>On browsers that support it, each backup's content is compressed before saving, fitting several times more notes into Telegram Cloud's limited space. This is fully automatic; where a browser doesn't support it, backups just save the older, uncompressed way with no issue.</p>
+            <h4 style="margin:14px 0 6px">⚠️ Limits</h4>
+            <p>Only note text/metadata is backed up — images always stay on the device that has them. Since backups live in Telegram's own cloud (not on this device), they're shared across every device where you open this same bot with the same account.</p>
+            <p>This feature doesn't depend on any separate server — it runs entirely on Telegram's own infrastructure (Telegram Cloud Storage). Because of that, a few technical limits come from Telegram itself: each stored value can hold at most 4096 characters (larger backups are automatically split into chunks), and the total number of stored keys (one auto slot plus up to ${MAX_MANUAL_BACKUPS} manual backups) is always kept safely under Telegram's 1024-key ceiling.</p>
+        </div>`;
+    showAdvanced(markhinDash_headHtml(`❓ ${fa?'راهنمای بکاپ Cloud':'Cloud Backup guide'}`,true,'markhinDash_showCloudPanel()') + bodyHtml);
+}
+window.markhinDash_showCloudHelp = markhinDash_showCloudHelp;
+
 async function markhinDash_cloudBackupClick(){
     const fa=currentLang==='fa';
+    const btn=document.getElementById('cloudBackupBtn'); if(btn) btn.disabled=true;
+    const labelInput = document.getElementById('cloudBackupLabelInput');
+    const label = labelInput ? labelInput.value : '';
     showToast(fa?'در حال بکاپ‌گیری...':'Backing up...', 1500);
-    const res = await cloudBackupNow();
+    const res = await cloudBackupNow('manual', label);
     if (res.ok) {
         showToast(fa
-            ? `✅ بکاپ ${res.meta.notes} یادداشت در Cloud تلگرام ذخیره شد.${res.meta.skipped?` (${res.meta.skipped} مورد رد شد)`:''}`
-            : `✅ Backed up ${res.meta.notes} notes to Telegram Cloud.${res.meta.skipped?` (${res.meta.skipped} skipped)`:''}`, 3200);
-        markhinDash_showCloudPanel();
+            ? `✅ بکاپ ${res.meta.notes} یادداشت ذخیره شد.${res.meta.skipped?` (${res.meta.skipped} مورد رد شد)`:''}`
+            : `✅ Saved a backup of ${res.meta.notes} notes.${res.meta.skipped?` (${res.meta.skipped} skipped)`:''}`, 3200);
+        markhinDash_renderCloudPanelBody();
     } else {
-        showToast(fa?'⚠️ بکاپ‌گیری انجام نشد. دوباره امتحان کن.':'⚠️ Backup failed. Please try again.', 3200);
+        // Upgrade: surface the actual reason (was a single generic message for
+        // every failure, which made 'unavailable' — e.g. CloudStorage dropped
+        // mid-session — indistinguishable from a real write failure worth retrying).
+        const reasonMsg = res.reason === 'unavailable'
+            ? (fa ? '⚠️ Cloud تلگرام در دسترس نیست. دوباره ربات را باز کن.' : '⚠️ Telegram Cloud is unavailable right now. Try reopening the bot.')
+            : (fa ? '⚠️ نوشتن در Cloud تلگرام ناموفق بود. دوباره امتحان کن.' : '⚠️ Writing to Telegram Cloud failed. Please try again.');
+        showToast(reasonMsg, 3200);
+        if(btn) btn.disabled=false;
     }
 }
 window.markhinDash_cloudBackupClick = markhinDash_cloudBackupClick;
 
-async function markhinDash_cloudRestoreClick(){
+// Bug fix: this was the only spot in the whole app still using the plain
+// browser confirm() — everywhere else goes out of its way to work around
+// Telegram's in-app WebView (see the comments throughout this file), but
+// native confirm()/alert()/prompt() dialogs are known to be unreliable or
+// outright suppressed in several Telegram client WebView builds. That made
+// "Restore from cloud" silently do nothing when tapped on those clients.
+// Telegram's own SDK ships TG.showConfirm() specifically to avoid this; we
+// use it when available and fall back to plain confirm() outside Telegram.
+function mu_cloudConfirm(message) {
+    return new Promise((resolve) => {
+        if (IS_TELEGRAM && TG && typeof TG.showConfirm === 'function') {
+            try { TG.showConfirm(message, (ok) => resolve(!!ok)); return; }
+            catch (e) { /* fall through to plain confirm below */ }
+        }
+        try { resolve(confirm(message)); } catch (e) { resolve(false); }
+    });
+}
+
+// Shows one backup's contents (note titles/folders) before committing to a
+// restore — the "👁 View" action from the panel's list.
+async function markhinDash_cloudViewBackup(id){
     const fa=currentLang==='fa';
-    const result = await cloudRestore();
-    if (!result) { showToast(fa?'بکاپی برای بازیابی پیدا نشد.':'No backup found to restore.', 2600); return; }
-    const ok = confirm(fa
-        ? `${result.data.notes.length} یادداشت متنی از Cloud تلگرام بازیابی می‌شود.\nیادداشت‌هایی که همین‌جا هم وجود دارند (با شناسه یکسان) فقط در صورتی به‌روزرسانی می‌شوند که نسخه‌ی Cloud جدیدتر باشد؛ تصاویرشان دست‌نخورده می‌ماند. یادداشت‌های جدید اضافه می‌شوند. ادامه می‌دهی؟`
-        : `${result.data.notes.length} text notes will be restored from Telegram Cloud.\nNotes that already exist here (same id) are only updated if the cloud copy is newer — their images are left untouched. New notes are added. Continue?`);
+    showAdvanced(markhinDash_headHtml(`👁 ${fa?'محتوای بکاپ':'Backup contents'}`,true,'markhinDash_showCloudPanel()')+
+        `<div id="cloudViewBody" style="font-size:12.5px;line-height:1.9">${fa?'در حال بارگذاری...':'Loading...'}</div>`);
+    const result = await cloudRestoreBackup(id);
+    const body = document.getElementById('cloudViewBody');
+    if (!body) return;
+    if (!result) {
+        body.innerHTML = `<div class="markhin-smart-empty">${fa?'این بکاپ پیدا نشد یا خراب است.':'This backup could not be found or is corrupted.'}</div>`;
+        return;
+    }
+    const notes = result.data.notes || [];
+    const rowsHtml = notes.slice()
+        .sort((a,b)=>(Date.parse(b.lastEdited)||0)-(Date.parse(a.lastEdited)||0))
+        .map(n => `<div class="markhin-smart-item"><b>${escapeHtml(n.name||(fa?'(بدون عنوان)':'(untitled)'))}</b>${n.folder?`<div class="markhin-dash-meta" style="opacity:.6;font-size:11px">📁 ${escapeHtml(n.folder)}</div>`:''}</div>`)
+        .join('');
+    body.innerHTML =
+        (result.meta.label ? `<p style="margin:0 0 4px"><b>📌 ${escapeHtml(result.meta.label)}</b></p>` : '') +
+        `<p style="opacity:.7">${mu_fmtCloudDate(result.meta.ts)} · ${notes.length} ${fa?'یادداشت':'notes'}${result.meta.skipped?` · ⚠️ ${result.meta.skipped} ${fa?'رد شد':'skipped'}`:''}</p>` +
+        `<div style="margin:10px 0"><button type="button" class="btn-main btn-save-prominent" style="width:100%" onclick="markhinDash_cloudRestoreClick('${id}')">📥 ${fa?'بازیابی همین بکاپ':'Restore this backup'}</button></div>` +
+        (rowsHtml || `<div class="markhin-smart-empty">${fa?'یادداشتی در این بکاپ نیست.':'No notes in this backup.'}</div>`);
+}
+window.markhinDash_cloudViewBackup = markhinDash_cloudViewBackup;
+
+// Deletes one manual backup snapshot — the "🗑 Delete" action from the
+// panel's list. The auto slot is never offered a delete button (it's
+// managed automatically, so there is nothing useful to delete there).
+async function markhinDash_cloudDeleteClick(id){
+    const fa=currentLang==='fa';
+    const ok = await mu_cloudConfirm(fa ? 'این بکاپ برای همیشه حذف می‌شود. ادامه می‌دهی؟' : 'This backup will be permanently deleted. Continue?');
+    if (!ok) return;
+    showToast(fa?'در حال حذف...':'Deleting...', 1200);
+    await cloudDeleteBackup(id);
+    showToast(fa?'🗑 بکاپ حذف شد.':'🗑 Backup deleted.', 2000);
+    markhinDash_showCloudPanel();
+}
+window.markhinDash_cloudDeleteClick = markhinDash_cloudDeleteClick;
+
+async function markhinDash_cloudRestoreClick(id){
+    const fa=currentLang==='fa';
+    const result = await cloudRestoreBackup(id);
+    if (!result) { showToast(fa?'این بکاپ پیدا نشد یا خراب است.':'This backup could not be found or is corrupted.', 2600); return; }
+    const backupDesc = result.meta.label
+        ? (fa ? `«${result.meta.label}» (${mu_fmtCloudDate(result.meta.ts)})` : `"${result.meta.label}" (${mu_fmtCloudDate(result.meta.ts)})`)
+        : mu_fmtCloudDate(result.meta.ts);
+    const ok = await mu_cloudConfirm(fa
+        ? `${result.data.notes.length} یادداشت متنی از این بکاپ (${backupDesc}) بازیابی می‌شود.\nیادداشت‌هایی که همین‌جا هم وجود دارند (با شناسه یکسان) فقط در صورتی به‌روزرسانی می‌شوند که نسخه‌ی بکاپ جدیدتر باشد؛ تصاویرشان دست‌نخورده می‌ماند. یادداشت‌های جدید اضافه می‌شوند. ادامه می‌دهی؟`
+        : `${result.data.notes.length} text notes will be restored from this backup (${backupDesc}).\nNotes that already exist here (same id) are only updated if the backup copy is newer — their images are left untouched. New notes are added. Continue?`);
     if (!ok) return;
 
     let updated = 0, added = 0;
@@ -16642,6 +17055,10 @@ async function markhinDash_cloudRestoreClick(){
                 local.name = cloudItem.name; local.folder = cloudItem.folder;
                 local.tags = cloudItem.tags;
                 local.pinned = cloudItem.pinned; local.favorite = cloudItem.favorite; local.archived = !!cloudItem.archived;
+                if (cloudItem.order != null) local.order = Number(cloudItem.order) || 0;
+                if (cloudItem.fontFamily) local.fontFamily = cloudItem.fontFamily;
+                if (cloudItem.fontSize) local.fontSize = Number(cloudItem.fontSize) || local.fontSize;
+                if (Array.isArray(cloudItem.titleHistory)) local.titleHistory = cloudItem.titleHistory;
                 local.lastEdited = cloudItem.lastEdited;
                 if (isNoteLocked(cloudItem)) {
                     // Never let a cloud restore replace encrypted content with an
@@ -16684,7 +17101,9 @@ return {
     pickNoteToArchive: markhinDash_pickNoteToArchive,
     showCloudPanel: markhinDash_showCloudPanel,
     cloudBackupClick: markhinDash_cloudBackupClick,
-    cloudRestoreClick: markhinDash_cloudRestoreClick
+    cloudRestoreClick: markhinDash_cloudRestoreClick,
+    cloudViewBackup: markhinDash_cloudViewBackup,
+    cloudDeleteClick: markhinDash_cloudDeleteClick
 };
 })();
 
@@ -20188,6 +20607,21 @@ window.attachWrapperEvents = function(categoryId){
                     </div>
                   </div>
                 </div>
+                <div class="mg-card co-card" id="mgCardChaosOrb" onclick="mgLaunch('chaos-orb')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();mgLaunch('chaos-orb');}">
+                  <div class="mg-card-inner">
+                    <span class="mg-card-art co-card-art">
+                        <span class="co-card-swirl"></span>
+                        <span class="mg-card-emoji">🌀</span>
+                        <span class="mg-card-best" id="mgCardChaosOrbBest" hidden>🏆 <b id="mgCardChaosOrbBestVal">0</b></span>
+                    </span>
+                    <div class="mg-card-body">
+                        <span class="mg-card-title">CHAOS ORB</span>
+                        <span class="mg-card-title-fa" id="mgCardChaosOrbTitleFa">گوی آشوب</span>
+                        <span class="mg-card-desc" id="mgCardChaosOrbDesc">یه گوی نورانی رو با انگشتت دنبال کن، از موانع جاخالی بده و بلور جمع کن — ولی هر چند ثانیه یه قانون آشوب بدون هشدار همه‌چی رو عوض می‌کنه: کنترل‌ها وارونه می‌شن، سیاه‌چاله باز می‌شه، زمان می‌ایسته، بعضی قانون‌ها دروغ می‌گن و باس‌ها از راه می‌رسن! پاورآپ، کمبو و ۸ سطح آشوب. هیچی قابل پیش‌بینی نیست.</span>
+                        <span class="mg-card-play" id="mgCardChaosOrbPlay">🌀 برو تو آشوب</span>
+                    </div>
+                  </div>
+                </div>
                 <div class="mg-card td-card" id="mgCardTrapDevil" onclick="mgLaunch('trap-devil')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();mgLaunch('trap-devil');}">
                   <div class="mg-card-inner">
                     <span class="mg-card-art td-card-art">
@@ -20220,21 +20654,6 @@ window.attachWrapperEvents = function(categoryId){
                         <span class="mg-card-title-fa" id="mgCardTrapDevilTitleFa">فرار از تله‌های شیطون</span>
                         <span class="mg-card-desc" id="mgCardTrapDevilDesc">یه پلتفرمر بی‌رحم و پر از تله‌های کثیف: کف‌های تقلبی، تیغ‌های چرخون، فلش‌های ناغافل، سکوهای ناپدید‌شونده و حتی یه تیکه زمین که از پشت سرت کنده می‌شه و دنبالت می‌افته! به هیچی اعتماد نکن، شیطون همیشه یه غافلگیری تازه برات چیده! 😈</span>
                         <span class="mg-card-play" id="mgCardTrapDevilPlay">😈 شروع فرار</span>
-                    </div>
-                  </div>
-                </div>
-                <div class="mg-card co-card" id="mgCardChaosOrb" onclick="mgLaunch('chaos-orb')" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();mgLaunch('chaos-orb');}">
-                  <div class="mg-card-inner">
-                    <span class="mg-card-art co-card-art">
-                        <span class="co-card-swirl"></span>
-                        <span class="mg-card-emoji">🌀</span>
-                        <span class="mg-card-best" id="mgCardChaosOrbBest" hidden>🏆 <b id="mgCardChaosOrbBestVal">0</b></span>
-                    </span>
-                    <div class="mg-card-body">
-                        <span class="mg-card-title">CHAOS ORB</span>
-                        <span class="mg-card-title-fa" id="mgCardChaosOrbTitleFa">گوی آشوب</span>
-                        <span class="mg-card-desc" id="mgCardChaosOrbDesc">یه گوی نورانی رو با انگشتت دنبال کن، از موانع جاخالی بده و بلور جمع کن — ولی هر چند ثانیه یه قانون آشوب بدون هشدار همه‌چی رو عوض می‌کنه: کنترل‌ها وارونه می‌شن، سیاه‌چاله باز می‌شه، زمان می‌ایسته، بعضی قانون‌ها دروغ می‌گن و باس‌ها از راه می‌رسن! پاورآپ، کمبو و ۸ سطح آشوب. هیچی قابل پیش‌بینی نیست.</span>
-                        <span class="mg-card-play" id="mgCardChaosOrbPlay">🌀 برو تو آشوب</span>
                     </div>
                   </div>
                 </div>
@@ -31401,6 +31820,7 @@ function buildLevel3(){
     alt(2490, 132, 70);
     alt(2640, 140, 70);
     L.pickups.push({ t: 'feather', x: 2658, y: 114 }, { t: 'feather', x: 2684, y: 114 });
+    L.crumbles.push({ x: 2752, y: 146, w: 62, h: 16, state: 'idle', timer: 0, fallY: 0, vy: 0, seed: 0.7, grp: 6, idx: 0 });
     alt(2860, 152, 70);
     L.dodgers.push({ x: 2970, y: 174, w: 60, h: 14, homeX: 2970, awayX: 2970 + DODGE_HOP, state: 'home', timer: 0, fromX: 2970, toX: 3020 });
     alt(3080, 192, 70);
@@ -31417,7 +31837,6 @@ function buildLevel3(){
     L.pickups.push({ t: 'shield', x: 4060, y: 98 });
     L.bars.push({ px: 4180, py: 90, arms: 2, orbs: [22, 46], orbR: [9, 11], speed: 1.4, ph: 0 });
     L.blocks.push({ x: 4240, y: 124, w: 150, h: 24 });
-    L.pickups.push({ t: 'mimic', of: 'shield', x: 4290, y: 98 });
     L.spears.push({ x: 4390, y: 124, dir: -1, len: 78, per: 2.6, warn: 0.45, hold: 0.5, ph: 0, _ph: '' });
     L.blocks.push({ x: 4460, y: 158, w: 140, h: 24 });
 
@@ -31463,7 +31882,20 @@ function buildLevel3(){
     L.crumbles.push({ x: 7326, y: 292, w: 60, h: 16, state: 'idle', timer: 0, fallY: 0, vy: 0, seed: 1.8, grp: 5, idx: 2 });
     L.blocks.push({ x: 7420, y: 292, w: 150, h: 22 });
     L.pickups.push({ t: 'hourglass', x: 7470, y: 264, n: 1 });
-    L.pickups.push({ t: 'key', x: 7520, y: 264, aval: { x: 7440, y: 284, r: 22, speed: 190, endX: 7960 } });
+    L.pickups.push({ t: 'key', x: 7520, y: 264, aval: { x: 7400, y: 284, r: 22, speed: 140, endX: 7960 } });
+    /* Fix: the stretch from the end of the previous block (7570) to solid
+       ground (7960) was a 390px spike gap with nothing to land on — wider
+       than the max reachable distance even with both feathers saved up
+       (~305px). Two stepping-stone platforms break it into three short,
+       comfortable hops so the level is actually completable. */
+    /* Fix 2: a solid staircase/walkway now bridges the whole gap from the key
+       platform (ends 7570) to the ground at 7960 — no more jumping over spikes
+       while the chaser is on your heels. Steps rise slightly, then ease back
+       down to the ground level. */
+    L.blocks.push({ x: 7560, y: 292, w: 110, h: 22 });
+    L.blocks.push({ x: 7660, y: 284, w: 110, h: 30 });
+    L.blocks.push({ x: 7760, y: 276, w: 110, h: 38 });
+    L.blocks.push({ x: 7860, y: 288, w: 110, h: 26 });
     pit(2320, 7960);
 
     /* ---------- CH8 · THE BLACK GATE : back on solid ground, a forest of blades, the sealed gate, and the way out ---------- */
@@ -32003,15 +32435,21 @@ function resetAttempt(){
 
 function solidsNow(){
     const L = level, out = [];
-    for (let i = 0; i < L.ground.length; i++) out.push(L.ground[i]);
-    for (let i = 0; i < L.alts.length; i++) out.push(L.alts[i]);
-    L.movers.forEach(function(m){ out.push({ x: m.x, y: m.y, w: m.w, h: m.h, mover: m }); });
-    L.crumbles.forEach(function(c){ if (c.state !== 'gone') out.push({ x: c.x, y: c.y, w: c.w, h: c.h, crumble: c }); });
-    L.dodgers.forEach(function(d){ out.push({ x: d.x, y: d.y, w: d.w, h: d.h }); });
-    L.blinkers.forEach(function(b){ if (blinkOn(b)) out.push(b); });
-    for (let i = 0; i < L.blocks.length; i++) out.push(L.blocks[i]);
-    for (let i = 0; i < L.ghosts.length; i++) out.push(L.ghosts[i]);
-    L.gates.forEach(function(g){ const h = g.h * (1 - g.open); if (h > 1.5) out.push({ x: g.x, y: g.y, w: g.w, h: h, gate: g }); });
+    // Only objects within a small window around the player can possibly collide this
+    // step, so skip everything else instead of rebuilding+scanning the WHOLE level's
+    // solids list every physics substep (levels with many static platforms, like
+    // Level 3's floating blocks + invisible bridge tiles, made this the main cost).
+    const pad = 60, px0 = player.x - pad, px1 = player.x + PW + pad;
+    const near = function(r){ return r.x + r.w >= px0 && r.x <= px1; };
+    for (let i = 0; i < L.ground.length; i++){ const r = L.ground[i]; if (near(r)) out.push(r); }
+    for (let i = 0; i < L.alts.length; i++){ const r = L.alts[i]; if (near(r)) out.push(r); }
+    L.movers.forEach(function(m){ if (near(m)) out.push({ x: m.x, y: m.y, w: m.w, h: m.h, mover: m }); });
+    L.crumbles.forEach(function(c){ if (c.state !== 'gone' && near(c)) out.push({ x: c.x, y: c.y, w: c.w, h: c.h, crumble: c }); });
+    L.dodgers.forEach(function(d){ if (near(d)) out.push({ x: d.x, y: d.y, w: d.w, h: d.h }); });
+    L.blinkers.forEach(function(b){ if (blinkOn(b) && near(b)) out.push(b); });
+    for (let i = 0; i < L.blocks.length; i++){ const r = L.blocks[i]; if (near(r)) out.push(r); }
+    for (let i = 0; i < L.ghosts.length; i++){ const r = L.ghosts[i]; if (near(r)) out.push(r); }
+    L.gates.forEach(function(g){ if (!near(g)) return; const h = g.h * (1 - g.open); if (h > 1.5) out.push({ x: g.x, y: g.y, w: g.w, h: h, gate: g }); });
     return out;
 }
 function pbox(){ return { x: player.x, y: player.y, w: PW, h: PH }; }
@@ -34561,27 +34999,23 @@ function activate(id,shown,lie){
     // share the same depth). For every row that blocks BOTH inner lanes (its
     // only free lane is an outer one the player can no longer reach), clear
     // the hazards from one inner lane of that row so a way through always exists.
-    const rows=[];
-    for(let i=0;i<S.ents.length;i++){
+    // FIX: the old row-by-row sweep only looked at hazards sharing (almost) the exact
+    // same depth, so two hazards a hair apart in depth -- one in each inner lane --
+    // were treated as separate rows and both inner lanes could still end up
+    // blocked with no way out. Now ONE inner lane (the one the player is already
+    // nearest to) is cleared of every hazard still ahead, so a straight,
+    // guaranteed-safe path always exists the moment the walls close in.
+    const keepX=S.px<-.001?-.25:(S.px>.001?.25:(Math.random()<.5?-.25:.25));
+    for(let i=S.ents.length-1;i>=0;i--){
       const e=S.ents[i];
       if(!isHazard(e)||e.d<D0-1)continue;
-      let r=null;
-      for(let k=0;k<rows.length;k++){if(Math.abs(rows[k].d-e.d)<2){r=rows[k];break;}}
-      if(!r){r={d:e.d,ents:[]};rows.push(r);}
-      r.ents.push(e);
+      if(Math.abs(entX(e)-keepX)>=.3)continue;
+      proj(entX(e),e.d);
+      if(PR.u>2)burst(PR.X,PR.Y,6,['#ff5a1f','#ff9ecb','#fff'],140,.5,3,true,80);
+      S.ents.splice(i,1);
     }
-    rows.forEach(r=>{
-      const blk=x=>r.ents.some(e=>Math.abs(entX(e)-x)<.22);
-      if(blk(-.25)&&blk(.25)){
-        const x=Math.random()<.5?-.25:.25;
-        r.ents.forEach(e=>{
-          if(Math.abs(entX(e)-x)>=.22)return;
-          proj(entX(e),e.d);
-          if(PR.u>2)burst(PR.X,PR.Y,6,['#ff5a1f','#ff9ecb','#fff'],140,.5,3,true,80);
-          const k=S.ents.indexOf(e);if(k>=0)S.ents.splice(k,1);
-        });
-      }
-    });
+    // new rows continue from that safe lane instead of jumping to the other one
+    S.lastFreeX=keepX;S.freeHoldT=0;
   }
 }
 function tickLaws(dt,dtr){
