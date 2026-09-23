@@ -11120,9 +11120,16 @@ window.mu_syncHtmlBg = function(){
                 activeRecId = id;
                 renderContents();
 
+                // Real, ground-truth recording length — measured directly
+                // with the device clock, not guessed later from the file.
+                // See mu_fixWebmContainerDuration() for why this matters.
+                const mu_recStartTs = Date.now();
+
                 mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
                 mediaRecorder.onstop = async () => {
-                    const audioBlob = new Blob(audioChunks, { type: mediaRecorder?.mimeType || 'audio/webm' });
+                    const mu_recSeconds = Math.max(0, (Date.now() - mu_recStartTs) / 1000);
+                    const rawBlob = new Blob(audioChunks, { type: mediaRecorder?.mimeType || 'audio/webm' });
+                    const audioBlob = await mu_fixWebmContainerDuration(rawBlob, mu_recSeconds);
                     const mediaId = await mu_mediaPut(audioBlob);
                     const src = mediaId ? URL.createObjectURL(audioBlob) : await mu_blobToDataUrl(audioBlob);
                     insertAudioToNote(id, src, mediaId);
@@ -11138,19 +11145,201 @@ window.mu_syncHtmlBg = function(){
             }
         }
 
-        // Bug fix: audio recorded via MediaRecorder is a WebM/Opus (or similar)
-        // stream whose container header never gets a real duration written into
-        // it — the browser only finds out how long the clip actually is by
-        // reading all the way through it. Until then, Chromium-based browsers
-        // report audioEl.duration as Infinity or some other bogus, way-too-large
-        // number, which is exactly why a 1-second voice note could show up
-        // looking like it's "several hours" or "several minutes" long. The fix
-        // (standard workaround, no library needed) is to seek near the very end
-        // once metadata loads — that forces the browser to walk the whole file
-        // and compute the real duration — then jump the playhead back to 0.
-        // Applied both right after recording (insertAudioToNote) and whenever a
-        // saved voice note is hydrated back into a note (hydrateMedia), since
-        // both are places an <audio> element's src gets (re)assigned.
+        // ---------------------------------------------------------------
+        // Voice-note duration bug — root-cause fix
+        // ---------------------------------------------------------------
+        // Audio recorded via MediaRecorder is a WebM/Opus stream whose
+        // container header never gets a real "Duration" value written into
+        // it while recording — the browser doesn't know the final length
+        // until you stop. Chromium-based WebViews (this includes Telegram's
+        // in-app browser and most Android browsers) then try to *guess* the
+        // duration later by scanning the file, and for short clips that
+        // guess is wildly unreliable — which is exactly why a 2-second
+        // voice note could show up looking like "7 hours" or "14 seconds":
+        // what's being displayed is a bad guess, not the real time.
+        //
+        // The real fix is to stop guessing: we already know the *exact*
+        // recording length from our own start/stop timestamps
+        // (mu_recStartTs / mu_recSeconds above), so mu_fixWebmContainerDuration()
+        // writes that real value directly into the WebM file's header the
+        // moment recording stops. After that, the duration is simply read
+        // from the file everywhere it's used — nothing left to estimate.
+        //
+        // mu_fixAudioDuration() below (the "seek near the end" trick) is
+        // kept only as a fallback: for voice notes recorded before this fix
+        // existed, or for the rare file the patch below can't parse.
+
+        function mu_ebmlReadId(buf, off) {
+            const b0 = buf[off];
+            let len = 1, mask = 0x80;
+            while (len <= 4 && !(b0 & mask)) { mask >>= 1; len++; }
+            if (len > 4 || off + len > buf.length) return null;
+            let id = 0;
+            for (let i = 0; i < len; i++) id = id * 256 + buf[off + i];
+            return { id, len };
+        }
+
+        function mu_ebmlReadSize(buf, off) {
+            const b0 = buf[off];
+            let len = 1, mask = 0x80;
+            while (len <= 8 && !(b0 & mask)) { mask >>= 1; len++; }
+            if (len > 8 || off + len > buf.length) return null;
+            let size = b0 & (mask - 1);
+            let unknown = (b0 & (mask - 1)) === (mask - 1);
+            for (let i = 1; i < len; i++) {
+                size = size * 256 + buf[off + i];
+                if (buf[off + i] !== 0xff) unknown = false;
+            }
+            return { size, len, unknown };
+        }
+
+        function mu_ebmlEncodeSize(value, len) {
+            const bytes = new Uint8Array(len);
+            const marker = 0x80 >> (len - 1);
+            let v = value;
+            for (let i = len - 1; i >= 0; i--) { bytes[i] = v & 0xff; v = Math.floor(v / 256); }
+            bytes[0] |= marker;
+            return bytes;
+        }
+
+        // Locates (or, if missing, appends) the Segment > Info > Duration
+        // element inside a raw WebM byte buffer and writes durationSeconds
+        // into it. Returns a new Uint8Array, or null if the buffer's
+        // structure isn't what's expected — callers fall back to the
+        // original, unpatched blob in that case; this never throws.
+        function mu_patchWebmDuration(buffer, durationSeconds, timecodeScale) {
+            timecodeScale = timecodeScale || 1000000;
+            const SEGMENT_ID = 0x18538067, INFO_ID = 0x1549A966, DURATION_ID = 0x4489;
+
+            let off = 0, segment = null;
+            while (off < buffer.length - 4) {
+                const idInfo = mu_ebmlReadId(buffer, off);
+                if (!idInfo) return null;
+                const sizeInfo = mu_ebmlReadSize(buffer, off + idInfo.len);
+                if (!sizeInfo) return null;
+                const bodyOff = off + idInfo.len + sizeInfo.len;
+                if (idInfo.id === SEGMENT_ID) {
+                    segment = { off, idLen: idInfo.len, sizeLen: sizeInfo.len, size: sizeInfo.size, unknown: sizeInfo.unknown, bodyOff };
+                    break;
+                }
+                if (sizeInfo.unknown) return null;
+                off = bodyOff + sizeInfo.size;
+            }
+            if (!segment) return null;
+
+            const segmentEnd = segment.unknown ? buffer.length : segment.bodyOff + segment.size;
+            let infoOff = null, infoIdLen = 0, infoSizeLen = 0, infoSize = 0, infoBodyOff = 0;
+            off = segment.bodyOff;
+            while (off < segmentEnd - 2) {
+                const idInfo = mu_ebmlReadId(buffer, off);
+                if (!idInfo) break;
+                const sizeInfo = mu_ebmlReadSize(buffer, off + idInfo.len);
+                if (!sizeInfo || sizeInfo.unknown) break;
+                const bodyOff = off + idInfo.len + sizeInfo.len;
+                if (idInfo.id === INFO_ID) {
+                    infoOff = off; infoIdLen = idInfo.len; infoSizeLen = sizeInfo.len; infoSize = sizeInfo.size; infoBodyOff = bodyOff;
+                    break;
+                }
+                off = bodyOff + sizeInfo.size;
+            }
+            if (infoOff === null) return null;
+
+            let durationValueOff = null, durationValueLen = null;
+            off = infoBodyOff;
+            const infoEnd = infoBodyOff + infoSize;
+            while (off < infoEnd - 1) {
+                const idInfo = mu_ebmlReadId(buffer, off);
+                if (!idInfo) break;
+                const sizeInfo = mu_ebmlReadSize(buffer, off + idInfo.len);
+                if (!sizeInfo || sizeInfo.unknown) break;
+                const bodyOff = off + idInfo.len + sizeInfo.len;
+                if (idInfo.id === DURATION_ID && (sizeInfo.size === 4 || sizeInfo.size === 8)) {
+                    durationValueOff = bodyOff; durationValueLen = sizeInfo.size;
+                    break;
+                }
+                off = bodyOff + sizeInfo.size;
+            }
+
+            const durationTicks = (durationSeconds * 1000000000) / timecodeScale;
+
+            // Common case: Chrome already reserves a Duration slot (written
+            // with an invalid placeholder value) — overwrite those same
+            // bytes in place. Nothing else in the file has to move.
+            if (durationValueOff !== null) {
+                const out = new Uint8Array(buffer);
+                const view = new DataView(out.buffer);
+                if (durationValueLen === 8) view.setFloat64(durationValueOff, durationTicks, false);
+                else view.setFloat32(durationValueOff, durationTicks, false);
+                return out;
+            }
+
+            // No Duration element exists yet — append one as the last
+            // child of Info, then re-encode Info's (and, if it isn't
+            // "unknown"/streaming, Segment's) size to account for it. EBML
+            // size fields are allowed to use more bytes than the shortest
+            // possible encoding, so growing them by a byte when needed is
+            // valid, standards-conformant EBML — not a hack.
+            const durBytes = new Uint8Array(8);
+            new DataView(durBytes.buffer).setFloat64(0, durationTicks, false);
+            const durationElement = new Uint8Array([0x44, 0x89, 0x88, ...durBytes]);
+            const insertOff = infoEnd;
+            const added = durationElement.length;
+
+            const newInfoSize = infoSize + added;
+            const infoSizeLenFinal = (newInfoSize < Math.pow(2, 7 * infoSizeLen) - 1) ? infoSizeLen : infoSizeLen + 1;
+            const newInfoSizeBytes = mu_ebmlEncodeSize(newInfoSize, infoSizeLenFinal);
+
+            let newSegmentSizeBytes = null;
+            if (!segment.unknown) {
+                const infoSizeLenDelta = infoSizeLenFinal - infoSizeLen;
+                const newSegmentSize = segment.size + added + infoSizeLenDelta;
+                const segSizeLenFinal = (newSegmentSize < Math.pow(2, 7 * segment.sizeLen) - 1) ? segment.sizeLen : segment.sizeLen + 1;
+                newSegmentSizeBytes = mu_ebmlEncodeSize(newSegmentSize, segSizeLenFinal);
+            }
+
+            const parts = [
+                buffer.slice(0, segment.off + segment.idLen),
+                newSegmentSizeBytes || buffer.slice(segment.off + segment.idLen, segment.bodyOff),
+                buffer.slice(segment.bodyOff, infoOff + infoIdLen),
+                newInfoSizeBytes,
+                buffer.slice(infoBodyOff, insertOff),
+                durationElement,
+                buffer.slice(insertOff)
+            ];
+            const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+            let p = 0;
+            for (const part of parts) { out.set(part, p); p += part.length; }
+            return out;
+        }
+
+        // Public entry point: takes the just-recorded Blob plus the real,
+        // measured duration (in seconds) and returns a Blob with that
+        // duration baked into its header. Only WebM needs this — MP4/OGG
+        // recordings (Safari/Firefox) don't have this bug in the first
+        // place, so they're returned untouched. Any failure here falls
+        // back to the original blob rather than risking a broken
+        // recording — worst case, the seek-based fallback below still
+        // kicks in when the audio element is actually opened.
+        async function mu_fixWebmContainerDuration(blob, durationSeconds) {
+            try {
+                if (!blob || !(blob.type || '').includes('webm')) return blob;
+                if (!(durationSeconds > 0) || !isFinite(durationSeconds)) return blob;
+                const arrayBuffer = await blob.arrayBuffer();
+                const patched = mu_patchWebmDuration(new Uint8Array(arrayBuffer), durationSeconds, 1000000);
+                if (!patched) return blob;
+                return new Blob([patched], { type: blob.type });
+            } catch (e) {
+                return blob;
+            }
+        }
+
+        // Fallback only (see comment block above): seek near the very end
+        // once metadata loads — this forces the browser to walk the whole
+        // file and compute the real duration — then jump the playhead back
+        // to 0. Still applied both right after recording (insertAudioToNote,
+        // as a safety net) and whenever a saved voice note is hydrated back
+        // into a note (hydrateMedia), since both are places an <audio>
+        // element's src gets (re)assigned.
         function mu_fixAudioDuration(audioEl) {
             if (!audioEl) return;
             const tryFix = () => {
