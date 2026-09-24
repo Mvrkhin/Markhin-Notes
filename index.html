@@ -11024,6 +11024,11 @@ window.mu_syncHtmlBg = function(){
             renderButtons(visible);
             renderContents(visible);
             updateLockBtnState();
+            // See mu_nudgeRepaint's own comment: the rebuilt note cards/buttons
+            // above are exactly the kind of freshly-changed content that can be
+            // laid out correctly but left unpainted on the affected WebView
+            // builds until a tap or scroll forces a repaint by hand.
+            requestAnimationFrame(()=>requestAnimationFrame(()=>mu_nudgeRepaint()));
 
             const restore = () => {
                 // Suppressed while a caller (e.g. addNewCategory, right after
@@ -16488,6 +16493,23 @@ ${body}
             const notes=categories.filter(c=>!isArchived(c)&&!c.isDecoy);
             if(!notes.length){showToast(fa?'هنوز یادداشتی نیست.':'No notes yet.');return;}
 
+            // Building the graph means scoring every PAIR of notes for similarity,
+            // then running ~260 force-layout iterations (also pairwise) just to
+            // spread the circles apart. All of that used to run BEFORE the modal
+            // ever appeared, so with more than a handful of notes this was by far
+            // the slowest thing to open in the app — nothing was drawn on screen
+            // until the whole computation finished, which looked and felt frozen.
+            // Now the modal pops in immediately with a short loading message, and
+            // the heavy work runs a frame later so the pop-in animation itself is
+            // never the thing waiting on it.
+            showAdvanced(`<div class="advanced-head"><h3>🌌 ${fa?'شبکه دانش':'Knowledge Graph'}</h3><button class="btn-main" onclick="closeAdvancedModal()">✕</button></div>`+
+                `<div class="markhin-smart-empty">${fa?'در حال ساخت نقشه ارتباط‌ها…':'Building the connection map…'}</div>`);
+            const kgShellCard=document.getElementById('advancedCard');
+            if(kgShellCard) kgShellCard.classList.add('kg-wide');
+
+            requestAnimationFrame(()=>{ mu_buildKnowledgeGraph(fa, notes); });
+        }
+        function mu_buildKnowledgeGraph(fa, notes){
             // Locked notes that haven't been unlocked for MARKHIN AI keep their content
             // out of the similarity analysis entirely (same rule the AI/semantic-search
             // features already follow) — they still appear as isolated, dimmed nodes.
@@ -16648,11 +16670,11 @@ ${body}
             const card=document.getElementById('advancedCard');
             if(card) card.classList.add('kg-wide');
             const emptyPanelText=fa?'روی یک دایره کلیک کن تا ببینی با کدام یادداشت‌های دیگر و در چه چیزی مشترک است.':'Click a circle to see which other notes it shares words or tags with.';
-            showAdvanced(`<div class="advanced-head"><h3>🌌 ${fa?'شبکه دانش':'Knowledge Graph'}</h3><button class="btn-main" onclick="closeAdvancedModal()">✕</button></div>`+
+            if(card) card.innerHTML = `<div class="advanced-head"><h3>🌌 ${fa?'شبکه دانش':'Knowledge Graph'}</h3><button class="btn-main" onclick="closeAdvancedModal()">✕</button></div>`+
                 `<p style="opacity:.72;font-size:12.5px;line-height:1.95">${fa?'هر دایره یک یادداشت است و اندازه‌اش با حجم متن همان یادداشت بزرگ یا کوچک می‌شود. خط بین دو یادداشت یعنی واژگان یا تگ مشترک دارند — هرچه خط پررنگ‌تر و کوتاه‌تر باشد، شباهت بیشتر است. روی یک دایره کلیک کن تا در پنل پایین دقیقاً ببینی با هر یادداشت مرتبط چه واژه یا تگی مشترک دارد؛ برای باز کردن یادداشت، دوبار کلیک کن یا دکمه «باز کردن» را بزن.':"Each circle is a note, and its size grows or shrinks with how much text that note holds. A line between two notes means they share words or tags — the bolder and shorter the line, the stronger the match. Click a circle to see in the panel below exactly what it shares with each related note; double-click, or use the \"Open\" button, to open a note."}</p>`+
                 `<p style="opacity:.55;font-size:11px;margin:-6px 0 10px">${statsLine}</p>${svg}`+
-                `<div id="kgInfoPanel" class="kg-empty">${emptyPanelText}</div>`);
-            setTimeout(()=>mu_wireKnowledgeGraphHover(),0);
+                `<div id="kgInfoPanel" class="kg-empty">${emptyPanelText}</div>`;
+            mu_wireKnowledgeGraphHover();
         }
         function mu_wireKnowledgeGraphHover(){
             const svg=document.getElementById('knowledgeGraph'); if(!svg) return;
@@ -16706,11 +16728,37 @@ ${body}
                 `<div class="kg-info-list">${rows}</div>`;
         }
         async function graphOpenNote(id){closeAdvancedModal();await handleCategoryClick(id);}
+        // Known bug on Telegram's in-app Android WebView (also documented further
+        // up near the .note-card/.btn-main "contain:layout" rule): an element can
+        // finish LAYOUT correctly but its compositor layer never actually gets
+        // rasterized/painted, so it's genuinely invisible — an empty gap — until
+        // something forces a real repaint. A tap or a scroll happens to do that,
+        // which is why "click it and it reappears" / "scroll and it comes back"
+        // fixes it by hand. This reproduces that same forcing mechanism in code:
+        // nudging scroll position by 1px and immediately back makes the browser
+        // repaint without any visible motion. Call it right after new content
+        // becomes visible (a modal opening, the note list re-rendering, etc.).
+        function mu_nudgeRepaint(scrollEl){
+            try {
+                if (scrollEl) {
+                    const t = scrollEl.scrollTop;
+                    scrollEl.scrollTop = t + 1;
+                    scrollEl.scrollTop = t;
+                } else {
+                    const y = window.scrollY || window.pageYOffset || 0;
+                    window.scrollTo(0, y + 1);
+                    window.scrollTo(0, y);
+                }
+            } catch (e) {}
+        }
+        window.mu_nudgeRepaint = mu_nudgeRepaint;
         function showAdvanced(html){
             const m=document.getElementById('advancedModal');
             if (m) m.dataset.openerScrollY = String(window.scrollY || window.pageYOffset || 0);
-            document.getElementById('advancedCard').innerHTML=html;
+            const card=document.getElementById('advancedCard');
+            card.innerHTML=html;
             m.style.display='flex';
+            requestAnimationFrame(()=>{ requestAnimationFrame(()=>mu_nudgeRepaint(card)); });
         }
         function closeAdvancedModal(){
             const m=document.getElementById('advancedModal');
@@ -17651,16 +17699,29 @@ function markhinDash_showList(kind, value){
     const archiveActionsHtml=isArchiveView
         ? `<div style="margin:2px 0 10px"><button class="btn-main image-export-all-btn" type="button" onclick="markhinDash_pickNoteToArchive()">${fa?'➕ افزودن یادداشت به بایگانی':'➕ Add note to archive'}</button></div>`
         : '';
-    const bodyHtml=list.length
-        ? `<div class="markhin-smart-results" style="max-height:60vh">${list.map(x=>markhinDash_noteRowHtml(x,rowOpts)).join('')}</div>`
-        : `<div class="markhin-smart-empty">${isArchiveView?(fa?'بایگانی خالی است.':'The archive is empty.'):(fa?'یادداشتی پیدا نشد.':'No notes found.')}</div>`;
 
-    showAdvanced(markhinDash_headHtml(title, !isArchiveView)+archiveActionsHtml+`<div style="margin:2px 0 10px;font-size:11px;opacity:.6">${fa?'تعداد':'Count'}: ${list.length}</div>`+bodyHtml);
+    // Almost every menu option in the dashboard (pinned, favorites, locked,
+    // a tag, a folder, the archive, "all notes"...) funnels through this one
+    // function, and it used to build + insert the ENTIRE note list as one
+    // big HTML string before the panel ever appeared. With more than a
+    // couple dozen notes that's real, visible lag on every single one of
+    // those menu items — exactly the "most options feel slow" pattern.
+    // Now the panel (title, count, archive button) shows immediately, and
+    // the actual row list — the expensive part — is built and inserted a
+    // frame later.
+    showAdvanced(markhinDash_headHtml(title, !isArchiveView)+archiveActionsHtml+`<div style="margin:2px 0 10px;font-size:11px;opacity:.6">${fa?'تعداد':'Count'}: ${list.length}</div><div id="mdShowListBody"></div>`);
     document.getElementById('advancedCard')?.classList.add('kg-wide');
-    markhinDash_bindRows(document.getElementById('advancedCard'), isArchiveView ? {
-        onRowAction:(id)=>{ toggleArchiveNote(id); markhinDash_showList('archived'); },
-        onRowClick:(id)=>{ toggleArchiveNote(id); markhinDash_openNote(id); }
-    } : {});
+    requestAnimationFrame(()=>{
+        const bodyEl=document.getElementById('mdShowListBody');
+        if(!bodyEl) return; // panel was closed again before this frame ran
+        bodyEl.innerHTML = list.length
+            ? `<div class="markhin-smart-results" style="max-height:60vh">${list.map(x=>markhinDash_noteRowHtml(x,rowOpts)).join('')}</div>`
+            : `<div class="markhin-smart-empty">${isArchiveView?(fa?'بایگانی خالی است.':'The archive is empty.'):(fa?'یادداشتی پیدا نشد.':'No notes found.')}</div>`;
+        markhinDash_bindRows(document.getElementById('advancedCard'), isArchiveView ? {
+            onRowAction:(id)=>{ toggleArchiveNote(id); markhinDash_showList('archived'); },
+            onRowClick:(id)=>{ toggleArchiveNote(id); markhinDash_openNote(id); }
+        } : {});
+    });
 }
 window.markhinDash_showList=markhinDash_showList;
 
@@ -17670,12 +17731,16 @@ function markhinDash_pickNoteToArchive(){
     const fa=currentLang==='fa';
     const pool=allItems().filter(x=>!isArchived(x)).sort((a,b)=>String(a.name||'').localeCompare(String(b.name||''),'fa'));
     if(!pool.length){ showToast(fa?'یادداشتی برای افزودن به بایگانی وجود ندارد.':'No notes available to archive.'); markhinDash_showList('archived'); return; }
-    const rows=pool.map(x=>markhinDash_noteRowHtml(x,{actionLabel:fa?'📦 بایگانی':'📦 Archive'})).join('');
-    showAdvanced(markhinDash_headHtml(fa?'➕ افزودن یادداشت به بایگانی':'➕ Add note to archive', true, "markhinDash_showList('archived')")+`<div class="markhin-smart-results" style="max-height:60vh">${rows}</div>`);
+    showAdvanced(markhinDash_headHtml(fa?'➕ افزودن یادداشت به بایگانی':'➕ Add note to archive', true, "markhinDash_showList('archived')")+`<div class="markhin-smart-results" style="max-height:60vh" id="mdPickArchiveBody"></div>`);
     document.getElementById('advancedCard')?.classList.add('kg-wide');
-    markhinDash_bindRows(document.getElementById('advancedCard'), {
-        onRowAction:(id)=>{ toggleArchiveNote(id); markhinDash_pickNoteToArchive(); },
-        onRowClick:(id)=>{ toggleArchiveNote(id); markhinDash_pickNoteToArchive(); }
+    requestAnimationFrame(()=>{
+        const bodyEl=document.getElementById('mdPickArchiveBody');
+        if(!bodyEl) return;
+        bodyEl.innerHTML = pool.map(x=>markhinDash_noteRowHtml(x,{actionLabel:fa?'📦 بایگانی':'📦 Archive'})).join('');
+        markhinDash_bindRows(document.getElementById('advancedCard'), {
+            onRowAction:(id)=>{ toggleArchiveNote(id); markhinDash_pickNoteToArchive(); },
+            onRowClick:(id)=>{ toggleArchiveNote(id); markhinDash_pickNoteToArchive(); }
+        });
     });
 }
 window.markhinDash_pickNoteToArchive=markhinDash_pickNoteToArchive;
@@ -20814,16 +20879,29 @@ function mu_openSmartSearchModal(){
         <input type="text" id="muSmartInput" class="markhin-smart-input" placeholder="${fa?'تایپ کن...':'Type to search...'}" autocomplete="off">
         <div id="muSmartResults" class="markhin-smart-results"></div>
     `);
-    const input = document.getElementById('muSmartInput');
-    mu_renderSmartResults('');
-    if(input){
-        input.focus();
-        let timer;
-        input.addEventListener('input', ()=>{ clearTimeout(timer); timer=setTimeout(()=>mu_renderSmartResults(input.value), 160); });
-        input.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); } });
-    }
+    // showAdvanced() above only flips display:flex — it's cheap. But building
+    // the full result list (scoring every note, joining ~40 rows of HTML,
+    // wiring up their click handlers) used to run right after it in the same
+    // synchronous task, which blocks the browser from painting the modal's
+    // own pop-in animation until that work is done. On a vault with a lot of
+    // notes this is what made the panel feel like it "comes up slowly"
+    // instead of popping in immediately. Deferring it one frame lets the
+    // empty modal (and its animation) paint first; the results then fill in
+    // a frame later, which reads as instant even though the total work is
+    // the same.
+    requestAnimationFrame(()=>{
+        const input = document.getElementById('muSmartInput');
+        mu_renderSmartResults('');
+        if(input){
+            input.focus();
+            let timer;
+            input.addEventListener('input', ()=>{ clearTimeout(timer); timer=setTimeout(()=>mu_renderSmartResults(input.value), 160); });
+            input.addEventListener('keydown', e=>{ if(e.key==='Enter'){ e.preventDefault(); } });
+        }
+    });
 }
 window.runSmartSearch = mu_openSmartSearchModal;
+
 
 /* ---------- AI settings modal ---------- */
 function mu_openAiSettingsModal(){
@@ -44993,11 +45071,12 @@ function mAi_openAttImageFor(mid, idx) { return MU_AI.openAttImageFor(mid, idx);
 </script>
 
 <style id="muAtLtrFix">
-/* Text that starts with "@" (usernames, emails, handles) must read
-   left-to-right: "@" stays at the LEFT and typing continues to the right.
-   The app is RTL, so a field/line made only of neutral characters
-   ("@", "@123", "@user_1") used to fall back to RTL and put "@" on the
-   right. JS below marks such fields/lines with data-mu-at. */
+/* Text that starts with "@" (usernames, emails, handles) OR with a digit
+   (dates, measurements, versions — e.g. "26 Sep 2026", "3D model") must
+   read left-to-right: the leading character stays on the LEFT and typing/
+   reading continues to the right, instead of the app's RTL base direction
+   pulling the number groups and the Latin word into the wrong order.
+   JS below marks such fields/lines with data-mu-at. */
 input[data-mu-at], textarea[data-mu-at] {
     direction: ltr !important;
     text-align: left !important;
@@ -45019,12 +45098,25 @@ input[data-mu-at], textarea[data-mu-at] {
     var BLOCK_SEL = 'div,p,li,blockquote,pre,h1,h2,h3,h4,h5,h6';
     var BLOCK_RE = /^(DIV|P|LI|UL|OL|BLOCKQUOTE|PRE|H[1-6]|TABLE|TR|TD|TH)$/;
 
-    // true if the text starts with "@" and the first real letter after it
-    // is not Persian/Arabic/Hebrew (so "@user", "@123", "@" => LTR,
-    // while "@سلام" keeps normal RTL behavior).
+    // true if the text starts with "@" OR a digit, and the first real
+    // letter after that isn't Persian/Arabic/Hebrew:
+    //   "@user", "@123", "@"              => LTR   (unchanged)
+    //   "26 Sep 2026", "3D model", "7up"  => LTR   (new)
+    //   "@سلام", "3 تا از دوستام"          => stay RTL (an RTL letter wins)
+    //   digits/symbols only, no letters   => LTR default (harmless either way)
+    // This fixes the classic RTL bug where "number, then Latin word, then
+    // number" (dates being the most common case) gets visually scrambled:
+    // the digit groups cluster together and the Latin word jumps to the
+    // wrong side. CSS-only unicode-bidi:plaintext should, in principle,
+    // already pick the right base direction from the first strong
+    // character — but plaintext support is unreliable in the older
+    // WebViews this app runs in (see muAtLtrFix above), so it's marked
+    // explicitly here the same way "@" already is.
+    var LEAD_DIGIT = /^[0-9]/;
     function wantsLtr(text){
         var t = String(text == null ? '' : text).replace(LEAD, '');
-        if (t.charAt(0) !== '@') return false;
+        var c0 = t.charAt(0);
+        if (c0 !== '@' && !LEAD_DIGIT.test(c0)) return false;
         for (var i = 1; i < t.length; i++) {
             var c = t.charAt(i);
             if (STRONG_RTL.test(c)) return false;
@@ -45108,7 +45200,8 @@ input[data-mu-at], textarea[data-mu-at] {
 
     // Re-marking after (re)render. Saving a note rebuilds its .text-box from the
     // stored HTML, and sanitizeHtml() drops the data-mu-at marks, so a note that
-    // starts with "@" lost its left-to-right layout right after saving. Watch for
+    // starts with "@" or a digit (e.g. a date) lost its left-to-right layout
+    // right after saving. Watch for
     // boxes being created or their content being replaced and mark them again.
     var pendingBoxes = new Set();
     var flushQueued = false;
