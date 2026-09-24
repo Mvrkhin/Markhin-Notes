@@ -6668,7 +6668,7 @@
             function finish(){ if(done) return; done = true; resolve(); }
             var s = document.createElement('script');
             s.src = 'https://telegram.org/js/telegram-web-app.js';
-            s.onload = finish;
+            s.onload = function(){ finish(); if (typeof window.mu_lateTelegramSetup === 'function') window.mu_lateTelegramSetup(); };
             s.onerror = finish;
             document.head.appendChild(s);
             setTimeout(finish, 2500);
@@ -8499,10 +8499,24 @@ window.mu_syncHtmlBg = function(){
         // the person plainly instead of cycling through fallback methods that cannot
         // possibly work here.
         const IS_FILE_PROTOCOL = (location.protocol === 'file:');
+        // Bug fix: the SDK script defines window.Telegram.WebApp (with a CloudStorage object)
+        // even in an ordinary browser tab, so the old `!!(TG && TG.CloudStorage)` was true
+        // everywhere: the Cloud Backup button showed in plain Chrome/Safari and every save
+        // tried (and failed) to back up. Cloud storage is only usable inside a real Telegram
+        // client (it reports a platform / initData) of Bot API 6.9 or newer.
+        function mu_tgCloudAvailable(tg) {
+            try {
+                if (!tg || !tg.CloudStorage) return false;
+                const real = !!((tg.initData && String(tg.initData).length) || (tg.platform && tg.platform !== 'unknown'));
+                if (!real) return false;
+                if (typeof tg.isVersionAtLeast === 'function' && !tg.isVersionAtLeast('6.9')) return false;
+                return true;
+            } catch (_) { return false; }
+        }
         function mu_applyTelegramSetup(){
             TG = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
             IS_TELEGRAM = !!TG || /Telegram/i.test(navigator.userAgent || '');
-            hasCloudStorage = !!(TG && TG.CloudStorage);
+            hasCloudStorage = mu_tgCloudAvailable(TG);
             // Reflects the same IS_TELEGRAM && hasCloudStorage condition that used to
             // gate the "☁️ Telegram Cloud Backup" button inside the Dashboard modal —
             // that button now lives in the "ابزارهای ویژه" (Special Tools) toolbar
@@ -8530,6 +8544,9 @@ window.mu_syncHtmlBg = function(){
             } catch (_) {}
         }
         if (window.__muTgLoaded) { window.__muTgLoaded.then(mu_applyTelegramSetup); } else { mu_applyTelegramSetup(); }
+        // If telegram-web-app.js only finished loading AFTER the 2.5 s wait above (slow network),
+        // the setup ran with TG = null and cloud backup stayed off for the whole session.
+        window.mu_lateTelegramSetup = function(){ if (!TG && window.Telegram && window.Telegram.WebApp) mu_applyTelegramSetup(); };
 
         /* ---- real usable viewport height (fixes wasted/clipped space in Telegram) ----
            Plain 100vh inside Telegram's in-app WebView is unreliable: it doesn't track
@@ -8692,9 +8709,47 @@ window.mu_syncHtmlBg = function(){
         const CLOUD_CHUNK_SIZE = 3500; // safely under Telegram's 4096-char/value limit
         const CLOUD_INDEX_KEY = 'mk_idx';
         const CLOUD_BACKUP_PREFIX = 'mk_b_';
-        const MAX_MANUAL_BACKUPS = 7;
-        const MAX_CHUNKS_PER_BACKUP = 118; // (1 auto + 7 manual) * 118 = 944 keys + 1 index key = 945,
-        // leaving a ~79-key (~7.7%) safety margin under Telegram's hard 1024-key ceiling.
+        const CLOUD_CONFIG_KEY = 'mk_cfg';
+        /* ---- Manual-backup count setting --------------------------------
+           The person can choose how many manual snapshots to keep (0-7,
+           default 3) from Cloud Backup -> Settings. The key budget is FIXED
+           at ~960 of Telegram's 1024 keys (~64 spare) and is split equally
+           between the single auto slot and the manual slots:
+               keys per backup = floor((960 - 2 reserved) / (1 + manualCount))
+           (2 reserved = the `mk_idx` index key + the `mk_cfg` settings key).
+           With 0 manual backups the whole budget goes to the auto backup.
+           The chosen number is stored in Telegram Cloud (`mk_cfg`) so it is
+           shared by every device, with a localStorage copy as a fallback. */
+        const CLOUD_MANUAL_MIN = 0;
+        const CLOUD_MANUAL_MAX = 7;
+        const CLOUD_MANUAL_DEFAULT = 3;
+        const CLOUD_LOCAL_LIMIT_KEY = 'mk_manual_limit_v1';
+        const CLOUD_KEY_BUDGET = 960;
+        const CLOUD_RESERVED_KEYS = 2;
+        function cloudChunksPerSlot(manualCount) {
+            return Math.max(1, Math.floor((CLOUD_KEY_BUDGET - CLOUD_RESERVED_KEYS) / (1 + manualCount)));
+        }
+        // Accepts a number or numeric string; returns an integer 0-7 or null.
+        // (An empty string must NOT become 0 - Telegram returns '' for a missing key.)
+        function cloudNormalizeManualLimit(v) {
+            if (v === null || v === undefined) return null;
+            const str = String(v).trim();
+            if (!/^\d+$/.test(str)) return null;
+            const n = parseInt(str, 10);
+            return (n >= CLOUD_MANUAL_MIN && n <= CLOUD_MANUAL_MAX) ? n : null;
+        }
+        let MAX_MANUAL_BACKUPS = CLOUD_MANUAL_DEFAULT;
+        let MAX_CHUNKS_PER_BACKUP = cloudChunksPerSlot(CLOUD_MANUAL_DEFAULT);
+        function cloudApplyManualLimit(n) {
+            MAX_MANUAL_BACKUPS = n;
+            MAX_CHUNKS_PER_BACKUP = cloudChunksPerSlot(n);
+        }
+        (function () {
+            try {
+                const local = cloudNormalizeManualLimit(localStorage.getItem(CLOUD_LOCAL_LIMIT_KEY));
+                if (local !== null) cloudApplyManualLimit(local);
+            } catch (_) { /* storage unavailable: keep the default */ }
+        })();
         const CLOUD_LABEL_MAX_LEN = 60;
         // Pre-upgrade key names, kept only so cloudReadIndex() can migrate a
         // person's existing single backup into the new format the first time
@@ -8702,32 +8757,132 @@ window.mu_syncHtmlBg = function(){
         const CLOUD_META_KEY = 'mk_meta';
         const CLOUD_CHUNK_PREFIX = 'mk_c';
 
-        function cloudGetItem(key) {
+        /* ---- Low-level CloudStorage wrappers --------------------------------
+           Bug fix: every call used to wait forever for Telegram's callback. If a
+           single callback never arrived (dropped connection, WebView suspended in
+           the background) the promise never settled, and because every backup /
+           delete / settings operation is queued behind the previous one
+           (cloudSerial), ALL later cloud operations froze permanently until the
+           app was restarted. cloudGuard() settles each call after
+           CLOUD_CALL_TIMEOUT with the caller's failure value, so the queue always
+           keeps moving. */
+        const CLOUD_CALL_TIMEOUT = 15000;
+        function cloudGuard(start, onFail) {
             return new Promise((resolve) => {
-                try { TG.CloudStorage.getItem(key, (err, val) => resolve(err ? null : val)); }
-                catch (e) { resolve(null); }
+                let done = false;
+                let timer = null;
+                const finish = (v) => { if (done) return; done = true; clearTimeout(timer); resolve(v); };
+                timer = setTimeout(() => finish(onFail), CLOUD_CALL_TIMEOUT);
+                try { start(finish); } catch (e) { finish(onFail); }
             });
         }
-        function cloudGetItems(keys) {
-            return new Promise((resolve) => {
-                if (!keys.length) { resolve({}); return; }
-                try { TG.CloudStorage.getItems(keys, (err, vals) => resolve(err ? {} : (vals || {}))); }
-                catch (e) { resolve({}); }
-            });
+        function cloudGetItem(key) {
+            return cloudGuard((fin) => TG.CloudStorage.getItem(key, (err, val) => fin(err ? null : (val == null ? '' : val))), null);
+        }
+        // getItems / removeItems are sent in batches of 100 keys: a single backup can
+        // now span up to ~958 keys (auto backup with 0 manual backups), which is too
+        // much for one request/response.
+        const CLOUD_BATCH = 100;
+        function cloudGetItemsRaw(keys) {
+            return cloudGuard((fin) => TG.CloudStorage.getItems(keys, (err, vals) => fin(err ? null : (vals || {}))), null);
+        }
+        async function cloudGetItems(keys) {
+            const out = {};
+            for (let i = 0; i < keys.length; i += CLOUD_BATCH) {
+                const part = await cloudGetItemsRaw(keys.slice(i, i + CLOUD_BATCH));
+                if (part === null) return {}; // any failed batch = treat the whole read as failed
+                Object.assign(out, part);
+            }
+            return out;
         }
         function cloudSetItem(key, value) {
-            return new Promise((resolve) => {
-                try { TG.CloudStorage.setItem(key, value, (err, ok) => resolve(!err && ok !== false)); }
-                catch (e) { resolve(false); }
-            });
+            return cloudGuard((fin) => TG.CloudStorage.setItem(key, value, (err, ok) => fin(!err && ok !== false)), false);
         }
-        function cloudRemoveItems(keys) {
-            return new Promise((resolve) => {
-                if (!keys.length) { resolve(true); return; }
-                try { TG.CloudStorage.removeItems(keys, (err, ok) => resolve(!err)); }
-                catch (e) { resolve(false); }
-            });
+        function cloudRemoveItemsRaw(keys) {
+            return cloudGuard((fin) => TG.CloudStorage.removeItems(keys, (err) => fin(!err)), false);
         }
+        async function cloudRemoveItems(keys) {
+            let allOk = true;
+            for (let i = 0; i < keys.length; i += CLOUD_BATCH) {
+                if (!(await cloudRemoveItemsRaw(keys.slice(i, i + CLOUD_BATCH)))) allOk = false;
+            }
+            return allOk;
+        }
+        function cloudGetKeys() {
+            return cloudGuard((fin) => TG.CloudStorage.getKeys((err, keys) => fin(err ? null : (Array.isArray(keys) ? keys : []))), null);
+        }
+        // Chunk keys of a backup entry. Auto backups alternate between two key
+        // namespaces ('auto' / 'auto2', stored in entry.pfx) so a new version is written
+        // completely BEFORE the index switches to it (see cloudBackupNowImpl).
+        function cloudEntryPrefix(e) {
+            const p = (e && e.pfx) ? String(e.pfx) : String(e && e.id);
+            return /^[A-Za-z0-9_-]{1,60}$/.test(p) ? p : 'invalid';
+        }
+        function cloudEntryKeys(e) {
+            return cloudBackupChunkKeys(cloudEntryPrefix(e), (e && e.chunks) || 0);
+        }
+        // Splits at CLOUD_CHUNK_SIZE without ever cutting an emoji/surrogate pair in half:
+        // a lone surrogate is mangled to U+FFFD on its way through Telegram, silently
+        // corrupting text at every chunk boundary (only reachable on the uncompressed path).
+        function cloudSplitChunks(data) {
+            const chunks = [];
+            let i = 0;
+            while (i < data.length) {
+                let end = Math.min(i + CLOUD_CHUNK_SIZE, data.length);
+                if (end < data.length) {
+                    const c = data.charCodeAt(end - 1);
+                    if (c >= 0xD800 && c <= 0xDBFF) end--;
+                }
+                chunks.push(data.slice(i, end));
+                i = end;
+            }
+            return chunks;
+        }
+
+        /* ---- "Is this device already in sync with the cloud?" -------------------
+           Bug fix: a fresh install / cleared WebView (the exact situation cloud backup
+           exists for) has 0 notes. The very first save there (even just creating a
+           folder) scheduled an auto-backup that OVERWROTE the cloud auto slot with
+           that empty state — destroying the safety net. Now an auto-backup never
+           replaces a cloud backup that holds far more notes than this device has, until
+           the person restores or saves a manual backup (both mark the device "linked"). */
+        const CLOUD_LINKED_KEY = 'mk_cloud_linked_v1';
+        function cloudIsLinked() { try { return localStorage.getItem(CLOUD_LINKED_KEY) === '1'; } catch (_) { return false; } }
+        function cloudSetLinked() { try { localStorage.setItem(CLOUD_LINKED_KEY, '1'); } catch (_) {} }
+        function cloudAutoWouldBeBlocked(autoEntry) {
+            if (!autoEntry || !(autoEntry.notes > 0)) return false;
+            const n = categories.length;
+            if (n === 0) return true;
+            return !cloudIsLinked() && n < autoEntry.notes * 0.5;
+        }
+        let __cloudProtectNotified = false;
+        function cloudNotifyProtected(cloudNotes) {
+            if (__cloudProtectNotified) return;
+            __cloudProtectNotified = true;
+            const fa = currentLang === 'fa';
+            showToast(fa
+                ? `🛡 در Cloud بکاپی با ${cloudNotes} یادداشت هست؛ بکاپ خودکار رویش نوشته نمی‌شود. از دکمه‌ی ☁️ بازیابی کن.`
+                : `🛡 Your Cloud has a backup of ${cloudNotes} notes; auto-backup won't overwrite it. Restore it from the ☁️ button.`, 6000);
+        }
+        // On a device with NO notes that has never synced, offer to open the restore panel.
+        async function cloudStartupCheck() {
+            try {
+                if (window.__muTgLoaded) await window.__muTgLoaded;
+                if (!IS_TELEGRAM || !hasCloudStorage) return;
+                if (categories.length > 0 || cloudIsLinked()) return;
+                try { if (localStorage.getItem('mk_cloud_declined_v1') === '1') return; } catch (_) {}
+                const idx = await cloudSerial(() => cloudReadIndex());
+                const notes = idx.reduce((m, e) => Math.max(m, e.notes || 0), 0);
+                if (!notes || categories.length > 0 || !window.mu_cloudConfirm) return;
+                const fa = currentLang === 'fa';
+                const ok = await window.mu_cloudConfirm(fa
+                    ? `☁️ در Cloud تلگرام بکاپی با ${notes} یادداشت پیدا شد. پنل بازیابی باز شود؟`
+                    : `☁️ Found a Telegram Cloud backup with ${notes} notes. Open the restore panel?`);
+                if (ok) { if (window.markhinDash_showCloudPanel) window.markhinDash_showCloudPanel(); }
+                else { try { localStorage.setItem('mk_cloud_declined_v1', '1'); } catch (_) {} }
+            } catch (_) { /* purely a convenience prompt */ }
+        }
+
         function cloudBackupChunkKeys(id, count) {
             const keys = [];
             for (let i = 0; i < count; i++) keys.push(CLOUD_BACKUP_PREFIX + id + '_' + i);
@@ -8775,87 +8930,158 @@ window.mu_syncHtmlBg = function(){
             } catch (e) { return null; }
         }
 
-        // Strips embedded <img> markup (the one thing that can make a note huge)
-        // so the rest of its text/metadata has a real shot at fitting the cloud
-        // budget. Images are never part of the cloud backup — only a placeholder
-        // note that one lived in this spot, so restoring text elsewhere doesn't
-        // silently lose the fact that an image used to be there.
+        const CLOUD_PLACEHOLDERS = {
+            img:   ['[تصویر — فقط روی همین دستگاه]', '[image — this device only]'],
+            audio: ['[صدا — فقط روی همین دستگاه]', '[audio — this device only]']
+        };
+        function cloudPlaceholder(kind) {
+            return CLOUD_PLACEHOLDERS[kind][currentLang === 'fa' ? 0 : 1];
+        }
+        // Strips embedded images AND voice notes (the things that can make a note huge, or
+        // that would restore as a broken player on another device) so the rest of the
+        // note's text has a real shot at fitting the cloud budget. A short placeholder
+        // marks where each one was.
+        // Bug fix: this used regexes that never matched real wrappers (the app writes
+        // `id` before `class`), leaving stray <div>s behind, and it ignored <audio> entirely
+        // (a base64 voice note could exceed the whole cloud budget on its own).
         function cloudStripImages(html) {
-            const placeholder = currentLang === 'fa' ? '[تصویر — فقط روی همین دستگاه]' : '[image — this device only]';
-            return String(html || '')
-                .replace(/<div class="img-drag-wrapper"[\s\S]*?<\/div>\s*(<\/div>)?/g, placeholder)
-                .replace(/<img[^>]*>/g, placeholder);
+            const src = String(html || '');
+            if (!/<img|<audio|img-drag-wrapper|audio-wrapper/i.test(src)) return src;
+            try {
+                const tpl = document.createElement('template');
+                tpl.innerHTML = src;
+                const mk = (kind, block) => {
+                    if (block) { const d = document.createElement('div'); d.textContent = cloudPlaceholder(kind); return d; }
+                    return document.createTextNode(cloudPlaceholder(kind));
+                };
+                tpl.content.querySelectorAll('.img-drag-wrapper, .audio-wrapper').forEach(w => {
+                    w.replaceWith(mk(w.classList.contains('audio-wrapper') ? 'audio' : 'img', true));
+                });
+                tpl.content.querySelectorAll('img, audio').forEach(el => {
+                    el.replaceWith(mk(el.tagName === 'AUDIO' ? 'audio' : 'img', false));
+                });
+                return tpl.innerHTML;
+            } catch (_) {
+                return src.replace(/<img[^>]*>/gi, cloudPlaceholder('img')).replace(/<audio[\s\S]*?<\/audio>/gi, cloudPlaceholder('audio'));
+            }
+        }
+        function cloudHtmlHasMedia(html) {
+            return /<img|<audio|img-drag-wrapper|audio-wrapper|data-mu-media/i.test(String(html || ''));
+        }
+        // Restore helper: takes the (newer) cloud HTML, whose media are only placeholders,
+        // and puts the local note's real images/voice notes back in their place, in order.
+        // Any local media that has no placeholder to land on is appended at the end, so a
+        // restore can never lose an image.
+        function cloudMergeKeepMedia(cloudHtml, localHtml) {
+            const lt = document.createElement('template');
+            lt.innerHTML = String(localHtml || '');
+            const sel = '.img-drag-wrapper, .audio-wrapper, img, audio';
+            const blocks = { img: [], audio: [] };
+            lt.content.querySelectorAll(sel).forEach(el => {
+                if (el.parentElement && el.parentElement.closest(sel)) return; // nested inside another media block
+                const isAudio = el.classList.contains('audio-wrapper') || el.tagName === 'AUDIO';
+                blocks[isAudio ? 'audio' : 'img'].push(el.outerHTML);
+            });
+            let out = String(cloudHtml || '');
+            const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            ['img', 'audio'].forEach(kind => {
+                const alt = CLOUD_PLACEHOLDERS[kind].map(esc).join('|');
+                const re = new RegExp('<div>\\s*(?:' + alt + ')\\s*</div>|(?:' + alt + ')', 'g');
+                out = out.replace(re, (m) => (blocks[kind].length ? blocks[kind].shift() : m));
+            });
+            // Placeholders that found no local media to swap in stay visible as text.
+            return out + blocks.img.join('') + blocks.audio.join('');
         }
 
-        async function cloudBuildPayload() {
+        async function cloudBuildPayload(maxChunks) {
             // Most-recently-edited notes first, so if we run out of budget it's
             // the oldest/least-touched notes left out, not the one being worked on.
             const sorted = categories.slice().sort((a, b) => (Date.parse(b.lastEdited) || 0) - (Date.parse(a.lastEdited) || 0));
-            let included = sorted.map(item => {
+            const all = sorted.map(item => {
                 const persisted = getPersistedCategory(item);
                 return {
                     id: persisted.id, name: persisted.name, folder: persisted.folder,
                     text: persisted.text, html: cloudStripImages(persisted.html),
                     encrypted: persisted.encrypted, hint: persisted.hint,
                     tags: persisted.tags, pinned: persisted.pinned, favorite: persisted.favorite,
-                    // Bug fix: `archived` used to be missing here even though cloudRestore
-                    // reads cloudItem.archived when merging — so any archived note that got
-                    // backed up and later restored (here or on another device) had its
-                    // archived flag silently wiped back to false. order/fontFamily/fontSize/
-                    // titleHistory were dropped the same way, resetting sort position,
-                    // appearance and rename history on restore. All now carried over.
                     archived: persisted.archived, order: persisted.order,
                     fontFamily: persisted.fontFamily, fontSize: persisted.fontSize,
                     titleHistory: persisted.titleHistory,
+                    // Bug fix: these note fields were never backed up, so a restore (here or on
+                    // another device) silently dropped Fake Note content and reset Time Capsule /
+                    // Ghost / Decay settings — a time-capsule note came back instantly readable.
+                    fakeContent: persisted.fakeContent,
+                    unlockAt: persisted.unlockAt, ghostUntil: persisted.ghostUntil,
+                    decayLevel: persisted.decayLevel, decayManual: persisted.decayManual,
                     lastEdited: persisted.lastEdited
                 };
             });
-            const totalNotes = included.length;
+            const totalNotes = all.length;
             const customFolders = folders.filter(f => f !== DEFAULT_FOLDER);
-            let skipped = 0;
-            const budget = CLOUD_CHUNK_SIZE * MAX_CHUNKS_PER_BACKUP; // stay under one backup slot's key budget
+            const budget = CLOUD_CHUNK_SIZE * Math.max(1, maxChunks || MAX_CHUNKS_PER_BACKUP); // stay under this write's key budget
 
             const pack = async (list) => {
                 const raw = JSON.stringify({ v: 1, ts: Date.now(), folders: customFolders, notes: list });
-                return { raw, ...(await cloudCompress(raw)) };
+                return await cloudCompress(raw);
             };
+            const fits = (p) => p.data.length <= budget;
 
+            let included = all;
+            let skipped = 0;
             let packed = await pack(included);
-            // Compression means the real (post-gzip) size can only be known
-            // after packing, so trimming is iterative: cut a bite out of the
-            // note list, re-pack, check again — proportional to how far over
-            // budget we still are, so this converges in only a few rounds
-            // even for a very large note collection.
-            let guard = 0;
-            while (packed.data.length > budget && included.length > 1 && guard < 40) {
-                const overRatio = packed.data.length / budget;
-                const cut = Math.max(1, Math.floor(included.length * Math.min(0.4, (overRatio - 1) * 0.6)));
-                included = included.slice(0, -cut);
-                skipped += cut;
+            if (!fits(packed) && included.length) {
+                // 1) A single note that can never fit must not sink the whole backup:
+                //    leave just that one out. (rawLen is an upper bound of its packed size.)
+                const keep = [];
+                for (const n of included) {
+                    if (JSON.stringify(n).length + 300 <= budget) { keep.push(n); continue; }
+                    if (fits(await pack([n]))) keep.push(n); else skipped++;
+                }
+                included = keep;
                 packed = await pack(included);
-                guard++;
+                // 2) Binary-search the largest number of most-recent notes that fits
+                //    (the old cut-and-retry loop could give up after 40 rounds and fail).
+                if (!fits(packed) && included.length) {
+                    let lo = 0, hi = included.length - 1, best = null;
+                    while (lo < hi) {
+                        const mid = Math.ceil((lo + hi) / 2);
+                        const p = await pack(included.slice(0, mid));
+                        if (fits(p)) { lo = mid; best = { k: mid, p }; } else { hi = mid - 1; }
+                    }
+                    skipped += included.length - lo;
+                    packed = (best && best.k === lo) ? best.p : await pack(included.slice(0, lo));
+                }
             }
             return { data: packed.data, compressed: packed.compressed, skipped, totalNotes };
         }
 
         // Reads the `mk_idx` list of backup entries ({id, kind, ts, notes,
-        // skipped, chunks}), migrating a pre-upgrade single backup (the old
+        // skipped, chunks, c, len, pfx, label}), migrating a pre-upgrade single backup (the old
         // `mk_meta` + `mk_c{n}` keys) into it the first time this runs so
         // nobody's existing Telegram Cloud backup is stranded or lost.
         async function cloudReadIndex() {
             const raw = await cloudGetItem(CLOUD_INDEX_KEY);
+            // A FAILED read (null) must never be treated as "no index yet": that would
+            // overwrite the real index with [] below and orphan every backup.
+            if (raw === null) throw new Error('cloud-read-failed');
             const idx = raw ? safeParseJSON(raw, null) : null;
-            if (Array.isArray(idx)) return idx;
+            if (Array.isArray(idx)) return idx.filter(e => e && typeof e === 'object' && e.id);
             const legacyMetaRaw = await cloudGetItem(CLOUD_META_KEY);
+            if (legacyMetaRaw === null) throw new Error('cloud-read-failed');
             const legacyMeta = legacyMetaRaw ? safeParseJSON(legacyMetaRaw, null) : null;
             if (!legacyMeta || !legacyMeta.n) { await cloudSetItem(CLOUD_INDEX_KEY, '[]'); return []; }
             const oldKeys = []; for (let i = 0; i < legacyMeta.n; i++) oldKeys.push(CLOUD_CHUNK_PREFIX + i);
             const parts = await cloudGetItems(oldKeys);
+            // Bug fix: a failed/partial read used to be "migrated" as empty strings and the
+            // old chunks were then deleted — destroying the person's only backup.
+            if (oldKeys.some(k => !parts[k])) throw new Error('cloud-read-failed');
             const newKeys = cloudBackupChunkKeys('auto', legacyMeta.n);
-            for (let i = 0; i < legacyMeta.n; i++) await cloudSetItem(newKeys[i], parts[oldKeys[i]] || '');
-            await cloudRemoveItems(oldKeys.concat([CLOUD_META_KEY]));
+            for (let i = 0; i < legacyMeta.n; i++) {
+                if (!(await cloudSetItem(newKeys[i], parts[oldKeys[i]]))) throw new Error('cloud-read-failed');
+            }
             const migrated = [{ id: 'auto', kind: 'auto', ts: legacyMeta.ts, notes: legacyMeta.notes, skipped: legacyMeta.skipped || 0, chunks: legacyMeta.n }];
-            await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(migrated));
+            if (!(await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(migrated)))) throw new Error('cloud-read-failed');
+            await cloudRemoveItems(oldKeys.concat([CLOUD_META_KEY])); // only after the new copy + index are safely written
             return migrated;
         }
 
@@ -8868,61 +9094,225 @@ window.mu_syncHtmlBg = function(){
         }
 
         let __cloudBackupTimer = null;
+        let __cloudBackupPending = false;
+        function cloudFlushBackup() {
+            clearTimeout(__cloudBackupTimer);
+            if (!__cloudBackupPending) return;
+            __cloudBackupPending = false;
+            if (!IS_TELEGRAM || !hasCloudStorage) return;
+            cloudBackupNow('auto').catch(e => console.warn('Cloud backup failed', e));
+        }
         function scheduleCloudBackup() {
             if (!IS_TELEGRAM || !hasCloudStorage) return;
+            __cloudBackupPending = true;
             clearTimeout(__cloudBackupTimer);
-            __cloudBackupTimer = setTimeout(() => { cloudBackupNow('auto').catch(e => console.warn('Cloud backup failed', e)); }, 3000);
+            __cloudBackupTimer = setTimeout(cloudFlushBackup, 3000);
+        }
+        // Closing/minimising the mini app inside the 3-second debounce used to drop the
+        // last edit from the backup; flush it right away when the page is hidden.
+        document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') cloudFlushBackup(); });
+        window.addEventListener('pagehide', cloudFlushBackup);
+
+        // ---- Serialisation ---------------------------------------------------
+        // Every operation that reads-then-writes the shared index (backup,
+        // delete, settings change) runs one at a time, so an auto-backup firing
+        // in the middle of a manual one can never overwrite the other's index
+        // entry and leave orphaned keys behind.
+        let __cloudOpChain = Promise.resolve();
+        function cloudSerial(task) {
+            const run = __cloudOpChain.then(task);
+            __cloudOpChain = run.then(() => {}, () => {});
+            return run;
         }
 
-        // kind: 'auto' (default — silently overwrites the single auto slot)
-        // or 'manual' (creates a new, separately-kept snapshot; oldest manual
-        // snapshots beyond MAX_MANUAL_BACKUPS are pruned automatically).
-        // kind: 'auto' (default — silently overwrites the single auto slot)
-        // or 'manual' (creates a new, separately-kept snapshot; oldest manual
-        // snapshots beyond MAX_MANUAL_BACKUPS are pruned automatically).
+        // ---- Settings (manual backup count) ------------------------------------
+        let __cloudSettingsLoaded = false;
+        // Reads the shared setting from Telegram Cloud. Cached after the first
+        // successful read; `force` re-reads it (used when the panel opens and
+        // before every manual backup, so a change made on another device counts).
+        async function cloudLoadSettings(force) {
+            if (!hasCloudStorage) return MAX_MANUAL_BACKUPS;
+            if (__cloudSettingsLoaded && !force) return MAX_MANUAL_BACKUPS;
+            const raw = await cloudGetItem(CLOUD_CONFIG_KEY);
+            if (raw === null) return MAX_MANUAL_BACKUPS; // read error: keep current value, retry next time
+            const cfg = raw ? safeParseJSON(raw, null) : null;
+            const n = (cfg && typeof cfg === 'object') ? cloudNormalizeManualLimit(cfg.manualLimit) : null;
+            if (n !== null) {
+                cloudApplyManualLimit(n);
+                try { localStorage.setItem(CLOUD_LOCAL_LIMIT_KEY, String(n)); } catch (_) {}
+            }
+            __cloudSettingsLoaded = true;
+            return MAX_MANUAL_BACKUPS;
+        }
+
+        // Saves a new manual-backup count. If it is lower than the number of
+        // manual backups that exist, the OLDEST extra ones are deleted (the UI
+        // always asks the person to confirm first). The setting is written
+        // before anything is deleted, and the index is updated before the chunk
+        // keys are removed, so a failure part-way never leaves an index entry
+        // pointing at missing data.
+        function cloudApplyManualLimitChange(newLimit) {
+            return cloudSerial(() => (async () => {
+                if (!hasCloudStorage) return { ok: false, reason: 'unavailable' };
+                const n = cloudNormalizeManualLimit(newLimit);
+                if (n === null) return { ok: false, reason: 'invalid' };
+                const idx = await cloudReadIndex();
+                const manuals = idx.filter(e => e.kind === 'manual').sort((a, b) => (b.ts || 0) - (a.ts || 0));
+                const drop = manuals.slice(n);
+                const saved = await cloudSetItem(CLOUD_CONFIG_KEY, JSON.stringify({ v: 1, manualLimit: n }));
+                if (!saved) return { ok: false, reason: 'write-failed' };
+                cloudApplyManualLimit(n);
+                __cloudSettingsLoaded = true;
+                try { localStorage.setItem(CLOUD_LOCAL_LIMIT_KEY, String(n)); } catch (_) {}
+                if (drop.length) {
+                    const dropIds = new Set(drop.map(e => e.id));
+                    const idxOk = await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(idx.filter(e => !dropIds.has(e.id))));
+                    if (!idxOk) return { ok: false, reason: 'write-failed' };
+                    for (const old of drop) await cloudRemoveItems(cloudEntryKeys(old));
+                }
+                return { ok: true, removed: drop.length };
+            })().catch(e => { console.warn('Cloud settings error', e); return { ok: false, reason: 'unavailable' }; }));
+        }
+
+        // kind: 'auto' (default - silently overwrites the single auto slot)
+        // or 'manual' (creates a new, separately-kept snapshot; the oldest
+        // manual snapshots beyond the chosen limit are pruned automatically).
         // label: optional short text the person typed in for a manual
         // snapshot, so several saved backups stay identifiable at a glance.
-        async function cloudBackupNow(kind, label) {
+        // Result: { ok:true, meta } or { ok:false, reason } where reason is one of
+        // 'unavailable' | 'manual-disabled' | 'no-space' | 'too-large' | 'write-failed' | 'protected'.
+        function cloudBackupNow(kind, label) {
+            return cloudSerial(async () => {
+                try { return await cloudBackupNowImpl(kind, label); }
+                catch (e) {
+                    console.warn('Cloud backup error', e);
+                    return { ok: false, reason: (e && e.message === 'cloud-read-failed') ? 'unavailable' : 'write-failed' };
+                }
+            });
+        }
+        // Removes leftover chunk keys of one key-namespace at/after `keep` (from an older,
+        // larger version that a failed cleanup left behind) so they never eat the key budget.
+        async function cloudRemoveStrayTail(pfx, keep) {
+            const all = await cloudGetKeys();
+            if (!all) return;
+            const head = CLOUD_BACKUP_PREFIX + pfx + '_';
+            const stray = all.filter(k => k.indexOf(head) === 0 && /^\d+$/.test(k.slice(head.length)) && parseInt(k.slice(head.length), 10) >= keep);
+            if (stray.length) await cloudRemoveItems(stray);
+        }
+        async function cloudBackupNowImpl(kind, label) {
             kind = (kind === 'manual') ? 'manual' : 'auto';
             if (!hasCloudStorage) return { ok: false, reason: 'unavailable' };
-            const { data, compressed, skipped, totalNotes } = await cloudBuildPayload();
-            const chunks = [];
-            for (let i = 0; i < data.length; i += CLOUD_CHUNK_SIZE) chunks.push(data.slice(i, i + CLOUD_CHUNK_SIZE));
+            await cloudLoadSettings(kind === 'manual');
+            if (kind === 'manual' && MAX_MANUAL_BACKUPS < 1) return { ok: false, reason: 'manual-disabled' };
 
             const idx = await cloudReadIndex();
             const id = kind === 'auto' ? 'auto' : ('m' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5));
             const prevEntry = idx.find(e => e.id === id);
-            const prevChunkCount = prevEntry ? (prevEntry.chunks || 0) : 0;
 
-            const keys = cloudBackupChunkKeys(id, chunks.length);
-            for (let i = 0; i < chunks.length; i++) {
-                const ok = await cloudSetItem(keys[i], chunks[i]);
-                if (!ok) return { ok: false, reason: 'write-failed' };
+            // Never let a (near-)empty fresh device overwrite a real cloud backup.
+            if (kind === 'auto' && cloudAutoWouldBeBlocked(prevEntry)) {
+                cloudNotifyProtected(prevEntry.notes);
+                return { ok: false, reason: 'protected' };
             }
-            // Clean up leftover chunk keys from a previous, larger version of
-            // this same slot (only relevant for the 'auto' id, which is reused).
-            if (prevChunkCount > chunks.length) {
-                await cloudRemoveItems(cloudBackupChunkKeys(id, prevChunkCount).slice(chunks.length));
+
+            // A new manual snapshot takes one of the manual slots, so only the
+            // newest (limit - 1) existing ones survive; older ones are "overflow".
+            let overflow = [];
+            if (kind === 'manual') {
+                const manuals = idx.filter(e => e.kind === 'manual').sort((a, b) => (b.ts || 0) - (a.ts || 0));
+                overflow = manuals.slice(Math.max(0, MAX_MANUAL_BACKUPS - 1));
+            }
+            const overflowIds = new Set(overflow.map(e => e.id));
+
+            // Key budget: what is left after every OTHER backup that stays. Using the
+            // real index (not just the setting) keeps the total under budget even if
+            // existing backups are bigger than the current per-backup share (e.g. right
+            // after the person raised the manual count) or another device changed it.
+            const othersChunks = idx
+                .filter(e => e.id !== id && !overflowIds.has(e.id))
+                .reduce((sum, e) => sum + (e.chunks || 0), 0);
+            const room = CLOUD_KEY_BUDGET - CLOUD_RESERVED_KEYS - othersChunks;
+            const allowed = Math.min(MAX_CHUNKS_PER_BACKUP, room);
+            if (allowed < 1) return { ok: false, reason: 'no-space' };
+
+            const { data, compressed, skipped, totalNotes } = await cloudBuildPayload(allowed);
+            // A manual snapshot is never silently shrunk: if it only got a reduced share
+            // it must still contain EVERY note (the auto backup may leave old notes out).
+            if (kind === 'manual' && allowed < MAX_CHUNKS_PER_BACKUP && skipped > 0) return { ok: false, reason: 'no-space' };
+            if (totalNotes > 0 && totalNotes - skipped <= 0) return { ok: false, reason: 'too-large' };
+            const chunks = cloudSplitChunks(data);
+            if (!chunks.length || chunks.length > allowed) return { ok: false, reason: 'too-large' };
+
+            const totalKeysNow = CLOUD_RESERVED_KEYS + idx.reduce((sum, e) => sum + (e.chunks || 0), 0);
+
+            // Bug fix (auto backup corrupted by an interrupted write): the auto slot used to be
+            // overwritten chunk by chunk while the index still described the old version, so
+            // closing the app / losing signal mid-write left a mix of old and new chunks —
+            // unreadable when compressed, and SILENTLY WRONG NOTE TEXT when not. Now the new
+            // version is written to the other key-namespace ('auto' <-> 'auto2') and the index
+            // only switches to it after every chunk landed. (Only if both copies could not fit
+            // under Telegram's key ceiling does it fall back to overwriting in place.)
+            let pfx = id;
+            if (kind === 'auto') {
+                const oldPfx = prevEntry ? cloudEntryPrefix(prevEntry) : null;
+                const canDouble = totalKeysNow + chunks.length <= 1000;
+                if (!oldPfx) pfx = 'auto';
+                else if (canDouble) pfx = (oldPfx === 'auto') ? 'auto2' : 'auto';
+                else pfx = oldPfx;
+            }
+            const inPlace = !!(prevEntry && cloudEntryPrefix(prevEntry) === pfx);
+
+            // Overflow snapshots are removed BEFORE writing only when old + new could not
+            // fit under Telegram's key ceiling at the same time; otherwise they are removed
+            // after the new snapshot is safely saved, so a failed write never costs the
+            // person an old backup. (Index is always updated before its keys are removed.)
+            const pruneFirst = overflow.length > 0 && (totalKeysNow + chunks.length > 1000);
+            if (pruneFirst) {
+                const pruned = await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(idx.filter(e => !overflowIds.has(e.id))));
+                if (!pruned) return { ok: false, reason: 'write-failed' };
+                for (const old of overflow) await cloudRemoveItems(cloudEntryKeys(old));
+            }
+
+            const keys = cloudBackupChunkKeys(pfx, chunks.length);
+            // Keys of a version that has no index entry yet are removed on failure so they
+            // don't become orphans eating the key budget forever.
+            const rollback = async (n) => { if (!inPlace) await cloudRemoveItems(keys.slice(0, n)); };
+            for (let i = 0; i < chunks.length; i++) {
+                if (!(await cloudSetItem(keys[i], chunks[i]))) {
+                    await rollback(i + 1);
+                    return { ok: false, reason: 'write-failed' };
+                }
             }
 
             const cleanLabel = kind === 'manual' ? String(label || '').trim().slice(0, CLOUD_LABEL_MAX_LEN) : '';
-            const entry = { id, kind, ts: Date.now(), notes: totalNotes - skipped, skipped, chunks: chunks.length, c: compressed ? 1 : 0, label: cleanLabel };
-            let nextIdx = idx.filter(e => e.id !== id);
-            nextIdx.push(entry);
+            const entry = { id, kind, ts: Date.now(), notes: totalNotes - skipped, skipped, chunks: chunks.length, c: compressed ? 1 : 0, len: data.length, label: cleanLabel };
+            if (pfx !== id) entry.pfx = pfx;
 
-            if (kind === 'manual') {
-                // Keep only the newest MAX_MANUAL_BACKUPS manual snapshots — older
-                // ones (and their chunk keys) are removed to stay under the
-                // shared Telegram Cloud key budget.
-                const manuals = nextIdx.filter(e => e.kind === 'manual').sort((a, b) => (b.ts || 0) - (a.ts || 0));
-                const overflow = manuals.slice(MAX_MANUAL_BACKUPS);
-                if (overflow.length) {
-                    for (const old of overflow) await cloudRemoveItems(cloudBackupChunkKeys(old.id, old.chunks));
-                    const overflowIds = new Set(overflow.map(e => e.id));
-                    nextIdx = nextIdx.filter(e => !overflowIds.has(e.id));
-                }
+            // Re-read the index right before committing: another device may have changed it
+            // while this (multi-second) write was running; committing from the stale copy
+            // read at the start would silently undo its change.
+            let fresh;
+            try { fresh = await cloudReadIndex(); }
+            catch (e) { await rollback(keys.length); return { ok: false, reason: 'write-failed' }; }
+            const prevFresh = fresh.find(e => e.id === id);
+            const nextIdx = fresh.filter(e => e.id !== id && !overflowIds.has(e.id));
+            nextIdx.push(entry);
+            const idxOk = await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(nextIdx));
+            if (!idxOk) {
+                await rollback(keys.length);
+                return { ok: false, reason: 'write-failed' };
             }
-            await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(nextIdx));
+            cloudSetLinked();
+
+            // Only after the index is safely updated: drop what it no longer points to.
+            if (overflow.length && !pruneFirst) {
+                for (const old of overflow) await cloudRemoveItems(cloudEntryKeys(old));
+            }
+            if (prevFresh) {
+                if (cloudEntryPrefix(prevFresh) !== pfx) await cloudRemoveItems(cloudEntryKeys(prevFresh));
+                else if ((prevFresh.chunks || 0) > chunks.length) await cloudRemoveItems(cloudBackupChunkKeys(pfx, prevFresh.chunks).slice(chunks.length));
+            }
+            try { await cloudRemoveStrayTail(pfx, chunks.length); } catch (_) {}
             return { ok: true, meta: entry };
         }
 
@@ -8931,12 +9321,15 @@ window.mu_syncHtmlBg = function(){
         // says its payload was stored gzip-compressed (`c: 1`).
         async function cloudRestoreBackup(id) {
             if (!hasCloudStorage) return null;
-            const idx = await cloudReadIndex();
+            let idx;
+            try { idx = await cloudReadIndex(); } catch (e) { return null; }
             const entry = idx.find(e => e.id === id);
             if (!entry || !entry.chunks) return null;
-            const keys = cloudBackupChunkKeys(id, entry.chunks);
+            const keys = cloudEntryKeys(entry);
             const parts = await cloudGetItems(keys);
-            const raw = keys.map(k => parts[k] || '').join('');
+            if (keys.some(k => !parts[k])) return null; // a missing chunk = unreadable, never a "best effort" partial restore
+            const raw = keys.map(k => parts[k]).join('');
+            if (entry.len && raw.length !== entry.len) return null;
             const json = entry.c ? await cloudDecompress(raw) : raw;
             if (json == null) return null;
             const data = safeParseJSON(json, null);
@@ -8944,14 +9337,20 @@ window.mu_syncHtmlBg = function(){
             return { meta: entry, data };
         }
 
-        // Deletes one manual backup snapshot (its chunk keys + its index entry).
-        async function cloudDeleteBackup(id) {
+        // Deletes one manual backup snapshot (its index entry + its chunk keys).
+        // The index is updated first, so a failure can never leave an entry
+        // that points at already-deleted data. Returns true on success.
+        function cloudDeleteBackup(id) {
+            return cloudSerial(() => cloudDeleteBackupImpl(id).catch(e => { console.warn('Cloud delete error', e); return false; }));
+        }
+        async function cloudDeleteBackupImpl(id) {
             if (!hasCloudStorage) return false;
             const idx = await cloudReadIndex();
             const entry = idx.find(e => e.id === id);
             if (!entry) return true;
-            await cloudRemoveItems(cloudBackupChunkKeys(id, entry.chunks));
-            await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(idx.filter(e => e.id !== id)));
+            const ok = await cloudSetItem(CLOUD_INDEX_KEY, JSON.stringify(idx.filter(e => e.id !== id)));
+            if (!ok) return false;
+            await cloudRemoveItems(cloudEntryKeys(entry));
             return true;
         }
 
@@ -10246,6 +10645,7 @@ window.mu_syncHtmlBg = function(){
             if (typeof mu_injectUiControls === 'function') mu_injectUiControls();
             updateLockBtnState();
             restoreStartupScroll();
+            try { cloudStartupCheck(); } catch (_) {}
         });
 
         function updateLockBtnState() {
@@ -11380,7 +11780,7 @@ window.mu_syncHtmlBg = function(){
             delBtn.innerText = '✖';
             delBtn.onclick = () => {
                 if (confirm(i18n[currentLang].confirmDelete)) {
-                    wrapper.remove();
+                    mu_removeMediaWrapper(wrapper);
                     saveCategory(id);
                 }
             };
@@ -11649,7 +12049,7 @@ window.mu_syncHtmlBg = function(){
                 delBtn.onclick = (e) => {
                     e.preventDefault(); e.stopPropagation();
                     if (confirm(i18n[currentLang].confirmDelete)) {
-                        wrapper.remove();
+                        mu_removeMediaWrapper(wrapper);
                         saveCategory(categoryId);
                     }
                 };
@@ -11895,7 +12295,7 @@ window.mu_syncHtmlBg = function(){
                 if (confirm(t.confirmDelete)) {
                     const { wrapper: w, categoryId: cId } = muImgLightboxCtx;
                     mu_closeImageLightbox();
-                    w.remove();
+                    mu_removeMediaWrapper(w);
                     if (cId) saveCategory(cId);
                 }
             };
@@ -11974,6 +12374,30 @@ window.mu_syncHtmlBg = function(){
         function mu_prepareImgAboveInsertion(textBox) {
             const isEmpty = !textBox || textBox.childNodes.length === 0;
             textBox.appendChild(isEmpty ? mu_createImgAboveLine() : mu_createImgTopDivider());
+        }
+
+        // Neutralizes just the dashed rule on a frame line/divider while
+        // leaving its blank spacing (margin/padding/min-height) exactly as
+        // it was — so deleting the media next to it removes only the dashed
+        // line, never the blank spacer line above/below it.
+        function mu_stripFrameLineDash(el) {
+            if (!el) return;
+            if (el.classList.contains('img-below-line') || el.classList.contains('img-top-divider')) el.style.borderTop = 'none';
+            else if (el.classList.contains('img-above-line')) el.style.borderBottom = 'none';
+        }
+
+        // Deletes an image/drawing/audio wrapper and strips the dashed line
+        // mu_prepareImgAboveInsertion()/mu_createImgBelowLine() auto-added right
+        // above and below it (.img-above-line/.img-top-divider before it,
+        // .img-below-line after it) — leaving their blank spacer lines in
+        // place untouched, only the dashed rule itself disappears.
+        function mu_removeMediaWrapper(wrapper) {
+            if (!wrapper) return;
+            const prev = wrapper.previousElementSibling;
+            const next = wrapper.nextElementSibling;
+            if (prev && (prev.classList.contains('img-top-divider') || prev.classList.contains('img-above-line'))) mu_stripFrameLineDash(prev);
+            if (next && next.classList.contains('img-below-line')) mu_stripFrameLineDash(next);
+            wrapper.remove();
         }
 
         async function insertImageToText(id, event) {
@@ -14780,9 +15204,20 @@ ${body}
                     }
                 };
 
-                if(selected.json && plainItems.length) await addExport('markhin_backup.json', async () => JSON.stringify({categories:plainItems.map(i=>({...i,text:getTxtContent(i.id,i)})),folders},null,2));
+                // Bug fix: JSON backup / Markdown export inside the ZIP bundle used to
+                // ship plainItems.html as-is — which only holds data-mu-media="<id>"
+                // references into this browser's local IndexedDB blob store, not the
+                // actual image/voice bytes. That's fine for DOCX (createDOCXBlob already
+                // resolves media internally) but meant markhin_backup.json/markhin_notes.md
+                // silently lost every image and voice note the moment they were opened on
+                // another device or after local storage was cleared — the JSON "looked"
+                // complete but the media was never really in it. Resolve once, lazily,
+                // and share the result between JSON and MD so media isn't decoded twice.
+                let mediaResolvedItems = null;
+                const getMediaResolvedItems = async () => { if (!mediaResolvedItems) mediaResolvedItems = await mu_resolveItemsMediaForExport(plainItems); return mediaResolvedItems; };
+                if(selected.json && plainItems.length) await addExport('markhin_backup.json', async () => { const ri = await getMediaResolvedItems(); return JSON.stringify({categories:ri.map(i=>({...i,text:getTxtContent(i.id,i)})),folders},null,2); });
                 if(selected.csv && plainItems.length) await addExport('markhin_data.csv', async () => '\ufeff'+[['ID','Name','Folder','Text','Tags','Pinned','Favorite','FontFamily','FontSize'],...plainItems.map(i=>[i.id,i.name,i.folder||'',getTxtContent(i.id,i)||'',(i.tags||[]).join('; '),i.pinned?'1':'0',i.favorite?'1':'0',i.fontFamily||'',i.fontSize||''])].map(r=>r.map(csvEscape).join(',')).join('\r\n'));
-                if(selected.md && plainItems.length) await addExport('markhin_notes.md', async () => '# Markhin Note\n\n'+plainItems.map((item,index)=>`# ${index+1}. ${markdownEscape(item.name)}\n\n${htmlToMarkdown(item.html,item.text)}`).join('\n\n---\n\n'));
+                if(selected.md && plainItems.length) await addExport('markhin_notes.md', async () => { const ri = await getMediaResolvedItems(); return '# Markhin Note\n\n'+ri.map((item,index)=>`# ${index+1}. ${markdownEscape(item.name)}\n\n${htmlToMarkdown(item.html,item.text)}`).join('\n\n---\n\n'); });
                 if(selected.txt && plainItems.length) await addExport('markhin_notes.txt', async () => plainItems.map((item,index)=>`========================================\n${index+1}. ${item.name}${item.folder?` [Folder: ${item.folder}]`:''}\n========================================\n${getTxtContent(item.id,item).replace(/\n+$/,'')}\n`).join('\n'));
 
                 if(selected.docx && plainItems.length) await addExport(plainItems.length===1?`${sanitizeFilename(plainItems[0].name)}.docx`:'Markhin_Note_All_Notes.docx', () => createDOCXBlob(plainItems));
@@ -17028,6 +17463,87 @@ function mu_fmtCloudDate(ts){
     try { return new Date(ts).toLocaleString(fa?'fa-IR':'en-US'); } catch(e){ return String(ts); }
 }
 
+// Approximate size label (1 KB = 1000 characters of stored text, the same
+// unit used everywhere else in the Cloud Backup panel). Switches to MB from
+// 1000 KB up so a big single backup reads "~3.4 MB" rather than "~3353 KB".
+function mu_fmtCloudSize(chars){
+    const fa=currentLang==='fa';
+    const kb=Math.max(1, Math.round(chars/1000));
+    if (kb>=1000) return `~${(kb/1000).toFixed(1)} ${fa?'مگابایت':'MB'}`;
+    return `~${kb} ${fa?'کیلوبایت':'KB'}`;
+}
+
+// One place for the user-facing text of every cloudBackupNow()/settings failure.
+function mu_cloudReasonMsg(reason, fa){
+    switch (reason) {
+        case 'unavailable':
+            return fa ? '⚠️ Cloud تلگرام در دسترس نیست. دوباره ربات را باز کن.' : '⚠️ Telegram Cloud is unavailable right now. Try reopening the bot.';
+        case 'manual-disabled':
+            return fa ? '⚠️ بکاپ دستی غیرفعال است (تعداد روی ۰ است). از «⚙️ تنظیمات بکاپ» تعدادش را بیشتر کن.' : '⚠️ Manual backups are turned off (set to 0). Increase the number in "⚙️ Backup settings".';
+        case 'no-space':
+            return fa ? '⚠️ فضای Cloud برای یک بکاپ دستی جدید کافی نیست. یکی از بکاپ‌های دستیِ قدیمی را حذف کن و دوباره امتحان کن.' : '⚠️ Not enough Cloud space for a new manual backup. Delete one of the older manual backups and try again.';
+        case 'too-large':
+            return fa ? '⚠️ حجم یادداشت‌ها از سقف یک بکاپ بیشتر است. تعداد بکاپ‌های دستی را کمتر کن تا سقف هر بکاپ بزرگ‌تر شود.' : '⚠️ Your notes are larger than one backup can hold. Lower the number of manual backups so each backup gets more space.';
+        case 'protected':
+            return fa ? '🛡 بکاپ خودکار روی بکاپ بزرگ‌ترِ موجود در Cloud نوشته نمی‌شود؛ اول آن را بازیابی کن.' : '🛡 Auto-backup will not overwrite the larger backup already in the Cloud; restore it first.';
+        case 'invalid':
+            return fa ? '⚠️ مقدار نامعتبر است.' : '⚠️ Invalid value.';
+        default:
+            return fa ? '⚠️ نوشتن در Cloud تلگرام ناموفق بود. دوباره امتحان کن.' : '⚠️ Writing to Telegram Cloud failed. Please try again.';
+    }
+}
+
+// The live "what would this setting mean" text under the number chips:
+// approximate size of the auto backup and of each manual backup for `n`
+// manual backups, plus what the change would do to the backups that exist.
+function mu_cloudLimitPreviewHtml(n, manualCount){
+    const fa=currentLang==='fa';
+    const per=cloudChunksPerSlot(n);
+    const one=mu_fmtCloudSize(per*CLOUD_CHUNK_SIZE);
+    const totalKeys=CLOUD_RESERVED_KEYS+(1+n)*per;
+    const total=mu_fmtCloudSize((1+n)*per*CLOUD_CHUNK_SIZE);
+    const rows=[];
+    rows.push(fa ? `🔄 بکاپ خودکار: تا <b>${one}</b>` : `🔄 Auto backup: up to <b>${one}</b>`);
+    if (n>0) {
+        rows.push(fa ? `📤 هر بکاپ دستی (${n} عدد): تا <b>${one}</b>` : `📤 Each manual backup (${n}): up to <b>${one}</b>`);
+    } else {
+        rows.push(fa ? `📤 بکاپ دستی: غیرفعال — تقریباً تمام فضا (حدود ${totalKeys} از ۱۰۲۴ کلید) فقط به بکاپ خودکار اختصاص می‌یابد.` : `📤 Manual backups: off — almost all the space (about ${totalKeys} of 1024 keys) goes to the auto backup alone.`);
+    }
+    rows.push(fa ? `📦 مجموع در بدترین حالت: ${total} (${totalKeys} کلید از ۱۰۲۴)` : `📦 Worst-case total: ${total} (${totalKeys} of 1024 keys)`);
+    if (n<manualCount) {
+        rows.push(fa ? `⚠️ الان ${manualCount} بکاپ دستی داری؛ با ذخیره‌ی این تنظیم، قدیمی‌ترین ${manualCount-n} تای آن‌ها حذف می‌شود.` : `⚠️ You currently have ${manualCount} manual backups; saving this setting deletes the oldest ${manualCount-n} of them.`);
+    }
+    if (n>MAX_MANUAL_BACKUPS) {
+        rows.push(fa ? 'ℹ️ چون فضا بین بکاپ‌های بیشتری تقسیم می‌شود، سقف حجم هر بکاپ کمتر می‌شود؛ اگر یادداشت‌هایت از این سقف بزرگ‌تر باشند، یادداشت‌هایی که مدت‌هاست ویرایش نشده‌اند در بکاپ جا نمی‌گیرند.' : 'ℹ️ Because the space is shared by more backups, each one gets a smaller cap; if your notes are bigger than that, the least recently edited ones won\u2019t fit into the backup.');
+    } else if (n<MAX_MANUAL_BACKUPS) {
+        rows.push(fa ? '✅ سقف حجم هر بکاپ بیشتر می‌شود.' : '✅ Each backup gets a larger size cap.');
+    }
+    rows.push(`<span style="opacity:.65">${fa ? 'حجم‌ها حداکثرِ متنِ فشرده‌ی ذخیره‌شده‌اند؛ چون قبل از ذخیره فشرده می‌شود، معمولاً چند برابرِ آن یادداشت در آن جا می‌شود.' : 'Sizes are the maximum of compressed text stored; since notes are compressed before saving, several times that much note text usually fits.'}</span>`);
+    return rows.map(r=>`<div style="margin:3px 0">${r}</div>`).join('');
+}
+
+// The collapsible "⚙️ Backup settings" block at the top of the Cloud Backup panel.
+function mu_cloudSettingsHtml(manualCount){
+    const fa=currentLang==='fa';
+    let chips='';
+    for (let i=CLOUD_MANUAL_MIN;i<=CLOUD_MANUAL_MAX;i++) {
+        const on = i===MAX_MANUAL_BACKUPS;
+        chips += `<button type="button" class="btn-main" data-limit-chip="${i}" onclick="markhinDash_cloudPickLimit(${i})" style="min-width:38px;${on?'outline:2px solid currentColor;font-weight:bold;':''}">${i}</button>`;
+    }
+    return `<details class="markhin-smart-item" style="margin:0 0 10px"${window.__mkCloudSettingsOpen?' open':''} ontoggle="window.__mkCloudSettingsOpen=this.open">
+        <summary style="cursor:pointer;font-weight:bold">⚙️ ${fa?`تنظیمات بکاپ (بکاپ دستی: ${MAX_MANUAL_BACKUPS} عدد)`:`Backup settings (manual backups: ${MAX_MANUAL_BACKUPS})`}</summary>
+        <div id="cloudLimitBox" data-pending="${MAX_MANUAL_BACKUPS}" data-manual-count="${manualCount}" style="margin-top:8px">
+            <div style="margin-bottom:6px">${fa?'تعداد بکاپ‌های دستی (۰ تا ۷):':'Number of manual backups (0 – 7):'}</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">${chips}</div>
+            <div id="cloudLimitPreview" style="font-size:12px;line-height:1.8">${mu_cloudLimitPreviewHtml(MAX_MANUAL_BACKUPS, manualCount)}</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:8px">
+                <button id="cloudApplyLimitBtn" type="button" class="btn-main btn-save-prominent" disabled onclick="markhinDash_cloudApplyLimitClick()">💾 ${fa?'ذخیره‌ی تنظیمات':'Save settings'}</button>
+                <button type="button" class="btn-main" onclick="markhinDash_showCloudSettingsHelp()">📖 ${fa?'راهنمای کامل':'Full guide'}</button>
+            </div>
+        </div>
+    </details>`;
+}
+
 function mu_cloudBackupRowHtml(e, opts){
     opts=opts||{};
     const fa=currentLang==='fa';
@@ -17037,8 +17553,8 @@ function mu_cloudBackupRowHtml(e, opts){
     // Upgrade: rough size estimate (chunks × chunk size) next to the note count,
     // so it's visible at a glance how much of a backup slot's budget is used —
     // ties into the size limits now spelled out in the Help panel.
-    const sizeKB = Math.max(1, Math.round(((e.chunks||0) * CLOUD_CHUNK_SIZE) / 1000));
-    const sub = `${mu_fmtCloudDate(e.ts)} · ${e.notes} ${fa?'یادداشت':'notes'} · ~${sizeKB} ${fa?'کیلوبایت':'KB'}${e.skipped?` · ⚠️ ${e.skipped} ${fa?'رد شد':'skipped'}`:''}`;
+    const sizeText = mu_fmtCloudSize((e.chunks||0) * CLOUD_CHUNK_SIZE);
+    const sub = `${mu_fmtCloudDate(e.ts)} · ${e.notes} ${fa?'یادداشت':'notes'} · ${sizeText}${e.skipped?` · ⚠️ ${e.skipped} ${fa?'رد شد':'skipped'}`:''}`;
     const delBtn = opts.allowDelete ? `<button type="button" class="btn-main" data-cloud-action="delete">🗑 ${fa?'حذف':'Delete'}</button>` : '';
     return `<div class="markhin-smart-item" data-backup-id="${escapeHtml(e.id)}" style="margin-bottom:8px">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
@@ -17060,8 +17576,10 @@ async function markhinDash_showCloudPanel(){
     // to go "back" to — the ✕ button should just close the overlay
     // (closeAdvancedModal), not jump into markhinDashboardMain() the way a
     // real Dashboard sub-screen's ✕ would.
+    window.__mkCloudSettingsOpen = false;
     showAdvanced(markhinDash_headHtml(`☁️ ${fa?'بکاپ Cloud تلگرام':'Telegram Cloud Backup'}`,false)+
         `<div id="cloudPanelBody" style="font-size:12.5px;line-height:1.9">${fa?'در حال بررسی...':'Checking...'}</div>`);
+    await cloudLoadSettings(true);
     await markhinDash_renderCloudPanelBody();
 }
 window.markhinDash_showCloudPanel = markhinDash_showCloudPanel;
@@ -17073,7 +17591,13 @@ async function markhinDash_renderCloudPanelBody(){
     const fa=currentLang==='fa';
     const body = document.getElementById('cloudPanelBody');
     if (!body) return;
-    const list = await cloudListBackups();
+    await cloudLoadSettings(false);
+    let list;
+    try { list = await cloudListBackups(); }
+    catch (e) {
+        body.innerHTML = `<div class="markhin-smart-empty">${fa?'⚠️ خواندن اطلاعات از Cloud تلگرام ناموفق بود. پنل را ببند و دوباره باز کن.':'⚠️ Could not read from Telegram Cloud. Close this panel and open it again.'}</div>`;
+        return;
+    }
     const autoEntry = list.find(e=>e.kind==='auto');
     const manualEntries = list.filter(e=>e.kind==='manual');
 
@@ -17084,18 +17608,26 @@ async function markhinDash_renderCloudPanelBody(){
         ? manualEntries.map(e=>mu_cloudBackupRowHtml(e,{allowDelete:true})).join('')
         : `<div class="markhin-smart-empty">${fa?'هنوز بکاپ دستی‌ای ذخیره نکرده‌ای.':'No manual backups saved yet.'}</div>`;
 
+    const manualEnabled = MAX_MANUAL_BACKUPS > 0;
     body.innerHTML =
         `<div style="margin:0 0 10px"><button type="button" class="btn-main" style="width:100%" onclick="markhinDash_showCloudHelp()">❓ ${fa?'راهنما و طرز استفاده':'Help & how to use'}</button></div>` +
         `<p style="opacity:.7">${fa?'⚠️ فقط متن و اطلاعات یادداشت‌ها بکاپ می‌شود؛ تصاویر فقط روی همین دستگاه می‌مانند و در بکاپ نیستند. این بکاپ بین همه‌ی دستگاه‌هایی که همین ربات را در تلگرام باز کنی مشترک است.':'⚠️ Only note text/metadata is backed up here — images stay on this device and are not included. This backup is shared across every device where you open this bot in Telegram.'}</p>` +
-        `<input id="cloudBackupLabelInput" type="text" maxlength="${CLOUD_LABEL_MAX_LEN}" placeholder="${fa?'برچسب اختیاری (مثلاً «قبل از پاکسازی پوشه‌ی کار»)…':'Optional label (e.g. "before clearing the work folder")…'}" style="width:100%;box-sizing:border-box;margin:4px 0 8px;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:inherit;font-size:12.5px">` +
-        (manualEntries.length >= MAX_MANUAL_BACKUPS
-            ? `<p style="opacity:.7;margin:0 0 8px">${fa?`ℹ️ به سقف ${MAX_MANUAL_BACKUPS} بکاپ دستی رسیده‌ای؛ ذخیره‌ی یک بکاپ جدید، قدیمی‌ترینشان را خودکار حذف می‌کند.`:`ℹ️ You're at the ${MAX_MANUAL_BACKUPS}-backup limit; saving a new one will automatically remove the oldest.`}</p>`
+        (cloudAutoWouldBeBlocked(autoEntry)
+            ? `<p style="margin:0 0 10px;padding:8px;border-radius:8px;background:rgba(255,193,7,.12)">${fa?`🛡 در Cloud بکاپی با ${autoEntry.notes} یادداشت هست ولی روی این دستگاه ${categories.length} یادداشت است؛ برای حفظ بکاپ، بکاپ خودکار رویش نوشته نمی‌شود. یکی از بکاپ‌ها را بازیابی کن (یا «ذخیره‌ی یک بکاپ جدید» را بزن).`:`🛡 The Cloud holds a backup of ${autoEntry.notes} notes but this device has ${categories.length}; auto-backup won't overwrite it. Restore one of the backups (or press "Save a new backup").`}</p>`
             : '') +
-        `<div style="margin:2px 0 10px"><button id="cloudBackupBtn" type="button" class="btn-main btn-save-prominent" style="width:100%" onclick="markhinDash_cloudBackupClick()">📤 ${fa?'ذخیره‌ی یک بکاپ جدید':'Save a new backup'}</button></div>` +
+        mu_cloudSettingsHtml(manualEntries.length) +
+        (manualEnabled
+            ? (`<input id="cloudBackupLabelInput" type="text" maxlength="${CLOUD_LABEL_MAX_LEN}" placeholder="${fa?'برچسب اختیاری (مثلاً «قبل از پاکسازی پوشه‌ی کار»)…':'Optional label (e.g. "before clearing the work folder")…'}" style="width:100%;box-sizing:border-box;margin:4px 0 8px;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:inherit;font-size:12.5px">` +
+                (manualEntries.length >= MAX_MANUAL_BACKUPS
+                    ? `<p style="opacity:.7;margin:0 0 8px">${fa?`ℹ️ به سقف ${MAX_MANUAL_BACKUPS} بکاپ دستی رسیده‌ای؛ ذخیره‌ی یک بکاپ جدید، قدیمی‌ترینشان را خودکار حذف می‌کند.`:`ℹ️ You're at the ${MAX_MANUAL_BACKUPS}-backup limit; saving a new one will automatically remove the oldest.`}</p>`
+                    : '') +
+                `<div style="margin:2px 0 10px"><button id="cloudBackupBtn" type="button" class="btn-main btn-save-prominent" style="width:100%" onclick="markhinDash_cloudBackupClick()">📤 ${fa?'ذخیره‌ی یک بکاپ جدید':'Save a new backup'}</button></div>`)
+            : `<p style="opacity:.7;margin:0 0 8px">${fa?'ℹ️ بکاپ دستی الان غیرفعال است (تعداد روی ۰ است)؛ تقریباً تمام فضای Cloud فقط به بکاپ خودکار اختصاص دارد. برای فعال‌کردنش، تعداد را در «⚙️ تنظیمات بکاپ» بالا زیاد کن.':'ℹ️ Manual backups are off (set to 0); almost all the Cloud space goes to the auto backup alone. To turn them on, raise the number in "⚙️ Backup settings" above.'}</p>`) +
         `<h4 style="margin:16px 0 6px;font-size:12.5px;opacity:.85">${fa?'وضعیت خودکار':'Auto state'}</h4>` +
         autoSectionHtml +
-        `<h4 style="margin:16px 0 6px;font-size:12.5px;opacity:.85">${fa?`بکاپ‌های ذخیره‌شده (${manualEntries.length} از ${MAX_MANUAL_BACKUPS})`:`Saved backups (${manualEntries.length} of ${MAX_MANUAL_BACKUPS})`}</h4>` +
-        manualSectionHtml;
+        ((manualEnabled || manualEntries.length)
+            ? `<h4 style="margin:16px 0 6px;font-size:12.5px;opacity:.85">${fa?`بکاپ‌های ذخیره‌شده (${manualEntries.length} از ${MAX_MANUAL_BACKUPS})`:`Saved backups (${manualEntries.length} of ${MAX_MANUAL_BACKUPS})`}</h4>` + manualSectionHtml
+            : '');
 
     body.querySelectorAll('[data-backup-id]').forEach(row=>{
         const id = row.dataset.backupId;
@@ -17118,14 +17650,14 @@ function markhinDash_showCloudHelp(){
     // Computed fresh each time so the numbers below always match the actual
     // constants above, even if MAX_MANUAL_BACKUPS/MAX_CHUNKS_PER_BACKUP change.
     const cloudBackupSizeKB = Math.round((MAX_CHUNKS_PER_BACKUP * CLOUD_CHUNK_SIZE) / 1000);
-    const cloudTotalKeysUsed = 1 + (1 + MAX_MANUAL_BACKUPS) * MAX_CHUNKS_PER_BACKUP; // 1 index key + (auto + manual slots) * chunks each
+    const cloudTotalKeysUsed = CLOUD_RESERVED_KEYS + (1 + MAX_MANUAL_BACKUPS) * MAX_CHUNKS_PER_BACKUP; // index + settings keys + (auto + manual slots) * chunks each
     const cloudKeyMargin = 1024 - cloudTotalKeysUsed;
     const bodyHtml = fa ? `
         <div style="font-size:12.5px;line-height:2">
             <h4 style="margin:0 0 6px">🔄 وضعیت خودکار</h4>
             <p>هر بار یادداشتی را ویرایش می‌کنی، چند ثانیه بعد برنامه به‌صورت خودکار و بی‌صدا آخرین وضعیت متن یادداشت‌هایت را در Cloud تلگرام ذخیره می‌کند. این فقط یک جایگاه است که هر بار جای نسخه‌ی قبلی‌اش را می‌گیرد — یک شبکه‌ی ایمنی است، نه یک تاریخچه؛ نیازی به کاری از طرف تو ندارد.</p>
             <h4 style="margin:14px 0 6px">📤 ذخیره‌ی یک بکاپ جدید</h4>
-            <p>با زدن این دکمه، یک نسخه‌ی مجزا و ثابت از وضعیت فعلی یادداشت‌هایت ساخته می‌شود که تا وقتی خودت حذفش نکنی دست‌نخورده باقی می‌ماند. می‌توانی برایش یک برچسب کوتاه هم بنویسی (مثلاً «قبل از پاکسازی پوشه‌ی کار») تا در لیست راحت‌تر شناخته شود؛ اگر چیزی ننویسی، فقط تاریخ نشان داده می‌شود. تا ${MAX_MANUAL_BACKUPS} بکاپ دستی می‌توانی هم‌زمان نگه داری؛ وقتی یکی بیشتر بسازی، قدیمی‌ترینشان خودکار حذف می‌شود.</p>
+            <p>با زدن این دکمه، یک نسخه‌ی مجزا و ثابت از وضعیت فعلی یادداشت‌هایت ساخته می‌شود که تا وقتی خودت حذفش نکنی دست‌نخورده باقی می‌ماند. می‌توانی برایش یک برچسب کوتاه هم بنویسی (مثلاً «قبل از پاکسازی پوشه‌ی کار») تا در لیست راحت‌تر شناخته شود؛ اگر چیزی ننویسی، فقط تاریخ نشان داده می‌شود. تا ${MAX_MANUAL_BACKUPS} بکاپ دستی می‌توانی هم‌زمان نگه داری؛ وقتی یکی بیشتر بسازی، قدیمی‌ترینشان خودکار حذف می‌شود. این تعداد را در بخش «⚙️ تنظیمات بکاپ» می‌توانی از ۰ تا ۷ تغییر دهی.</p>
             <h4 style="margin:14px 0 6px">👁 مشاهده</h4>
             <p>قبل از بازیابی، می‌توانی فهرست عنوان یادداشت‌های داخل هر بکاپ را ببینی تا مطمئن شوی همان نسخه‌ای است که می‌خواهی — بدون این‌که چیزی تغییر کند.</p>
             <h4 style="margin:14px 0 6px">📥 بازیابی</h4>
@@ -17136,14 +17668,14 @@ function markhinDash_showCloudHelp(){
             <p>روی مرورگرهایی که پشتیبانی می‌کنند، محتوای هر بکاپ قبل از ذخیره فشرده می‌شود تا چندین برابر یادداشت بیشتری در همان فضای محدود Cloud تلگرام جا شود. این کار کاملاً خودکار و پشت‌صحنه است؛ اگر مرورگری از آن پشتیبانی نکند، بدون هیچ مشکلی به همان روش قدیمی (بدون فشرده‌سازی) ذخیره می‌شود.</p>
             <h4 style="margin:14px 0 6px">⚠️ محدودیت‌ها</h4>
             <p>فقط متن و اطلاعات یادداشت‌ها بکاپ می‌شود — تصاویر همیشه فقط روی همان دستگاهی می‌مانند که در آن ذخیره شده‌اند. چون این بکاپ‌ها در فضای ابری خود تلگرام (نه روی این دستگاه) نگه‌داری می‌شوند، بین هر دستگاهی که همین ربات تلگرام را با همین حساب باز کنی مشترک‌اند.</p>
-            <p>این قابلیت به هیچ سرور جداگانه‌ای وابسته نیست؛ کاملاً روی زیرساخت خودِ تلگرام (Telegram Cloud Storage) کار می‌کند. به همین دلیل چند محدودیت فنی هم از طرف خودِ تلگرام روی آن اعمال می‌شود: هر مقدار ذخیره‌شده حداکثر ۴۰۹۶ کاراکتر می‌تواند باشد، برای همین هر بکاپ به قطعه‌های ۳۵۰۰ کاراکتری تقسیم می‌شود و حداکثر ${MAX_CHUNKS_PER_BACKUP} قطعه (حدود ${cloudBackupSizeKB} کیلوبایت متن) می‌تواند داشته باشد. کل تعداد کلیدهای مصرفی (۱ کلید فهرست + یک اسلات خودکار + حداکثر ${MAX_MANUAL_BACKUPS} بکاپ دستی، هرکدام تا ${MAX_CHUNKS_PER_BACKUP} کلید) در بدترین حالت به ${cloudTotalKeysUsed} کلید می‌رسد — یعنی حدود ${cloudKeyMargin} کلید به‌عنوان حاشیه امن، پیش از رسیدن به سقف ۱۰۲۴ کلیدیِ تلگرام، خالی باقی می‌ماند.</p>
+            <p>این قابلیت به هیچ سرور جداگانه‌ای وابسته نیست؛ کاملاً روی زیرساخت خودِ تلگرام (Telegram Cloud Storage) کار می‌کند. به همین دلیل چند محدودیت فنی هم از طرف خودِ تلگرام روی آن اعمال می‌شود: هر مقدار ذخیره‌شده حداکثر ۴۰۹۶ کاراکتر می‌تواند باشد، برای همین هر بکاپ به قطعه‌های ۳۵۰۰ کاراکتری تقسیم می‌شود و حداکثر ${MAX_CHUNKS_PER_BACKUP} قطعه (حدود ${cloudBackupSizeKB} کیلوبایت متن) می‌تواند داشته باشد. کل تعداد کلیدهای مصرفی (۲ کلید فهرست و تنظیمات + یک اسلات خودکار + حداکثر ${MAX_MANUAL_BACKUPS} بکاپ دستی، هرکدام تا ${MAX_CHUNKS_PER_BACKUP} کلید) در بدترین حالت به ${cloudTotalKeysUsed} کلید می‌رسد — یعنی حدود ${cloudKeyMargin} کلید به‌عنوان حاشیه امن، پیش از رسیدن به سقف ۱۰۲۴ کلیدیِ تلگرام، خالی باقی می‌ماند.</p>
         </div>`
     : `
         <div style="font-size:12.5px;line-height:2">
             <h4 style="margin:0 0 6px">🔄 Auto state</h4>
             <p>A few seconds after every edit, the app silently saves the latest state of your notes' text to Telegram Cloud. This is a single slot that gets overwritten each time — a safety net, not a history. Nothing to do on your part.</p>
             <h4 style="margin:14px 0 6px">📤 Save a new backup</h4>
-            <p>Creates a separate, fixed snapshot of your notes right now, kept untouched until you delete it. You can give it a short label (e.g. "before clearing the work folder") so it's easy to recognize in the list; leave it blank and only the date is shown. Up to ${MAX_MANUAL_BACKUPS} manual backups can exist at once; saving one more automatically removes the oldest.</p>
+            <p>Creates a separate, fixed snapshot of your notes right now, kept untouched until you delete it. You can give it a short label (e.g. "before clearing the work folder") so it's easy to recognize in the list; leave it blank and only the date is shown. Up to ${MAX_MANUAL_BACKUPS} manual backups can exist at once; saving one more automatically removes the oldest. You can change this number from 0 to 7 in "⚙️ Backup settings".</p>
             <h4 style="margin:14px 0 6px">👁 View</h4>
             <p>Before restoring, see the list of note titles inside any backup to confirm it's the version you want — nothing changes just by viewing.</p>
             <h4 style="margin:14px 0 6px">📥 Restore</h4>
@@ -17154,11 +17686,158 @@ function markhinDash_showCloudHelp(){
             <p>On browsers that support it, each backup's content is compressed before saving, fitting several times more notes into Telegram Cloud's limited space. This is fully automatic; where a browser doesn't support it, backups just save the older, uncompressed way with no issue.</p>
             <h4 style="margin:14px 0 6px">⚠️ Limits</h4>
             <p>Only note text/metadata is backed up — images always stay on the device that has them. Since backups live in Telegram's own cloud (not on this device), they're shared across every device where you open this same bot with the same account.</p>
-            <p>This feature doesn't depend on any separate server — it runs entirely on Telegram's own infrastructure (Telegram Cloud Storage). Because of that, a few technical limits come from Telegram itself: each stored value can hold at most 4096 characters, so every backup is split into 3500-character chunks and can hold at most ${MAX_CHUNKS_PER_BACKUP} chunks (roughly ${cloudBackupSizeKB} KB of text). The total number of keys used (1 index key + one auto slot + up to ${MAX_MANUAL_BACKUPS} manual backups, each up to ${MAX_CHUNKS_PER_BACKUP} keys) reaches ${cloudTotalKeysUsed} keys in the worst case — leaving about ${cloudKeyMargin} keys as a safety margin before Telegram's 1024-key ceiling.</p>
+            <p>This feature doesn't depend on any separate server — it runs entirely on Telegram's own infrastructure (Telegram Cloud Storage). Because of that, a few technical limits come from Telegram itself: each stored value can hold at most 4096 characters, so every backup is split into 3500-character chunks and can hold at most ${MAX_CHUNKS_PER_BACKUP} chunks (roughly ${cloudBackupSizeKB} KB of text). The total number of keys used (2 index/settings keys + one auto slot + up to ${MAX_MANUAL_BACKUPS} manual backups, each up to ${MAX_CHUNKS_PER_BACKUP} keys) reaches ${cloudTotalKeysUsed} keys in the worst case — leaving about ${cloudKeyMargin} keys as a safety margin before Telegram's 1024-key ceiling.</p>
         </div>`;
     showAdvanced(markhinDash_headHtml(`❓ ${fa?'راهنمای بکاپ Cloud':'Cloud Backup guide'}`,true,'markhinDash_showCloudPanel()') + bodyHtml);
 }
 window.markhinDash_showCloudHelp = markhinDash_showCloudHelp;
+
+// A chip (0-7) was tapped: only updates the preview - nothing is saved or
+// deleted until "Save settings" is pressed.
+function markhinDash_cloudPickLimit(n){
+    const box=document.getElementById('cloudLimitBox');
+    if(!box) return;
+    n=cloudNormalizeManualLimit(n);
+    if(n===null) return;
+    box.dataset.pending=String(n);
+    box.querySelectorAll('[data-limit-chip]').forEach(b=>{
+        const on=Number(b.dataset.limitChip)===n;
+        b.style.outline=on?'2px solid currentColor':'none';
+        b.style.fontWeight=on?'bold':'normal';
+    });
+    const preview=document.getElementById('cloudLimitPreview');
+    if(preview) preview.innerHTML=mu_cloudLimitPreviewHtml(n, Number(box.dataset.manualCount)||0);
+    const apply=document.getElementById('cloudApplyLimitBtn');
+    if(apply) apply.disabled=(n===MAX_MANUAL_BACKUPS);
+}
+window.markhinDash_cloudPickLimit = markhinDash_cloudPickLimit;
+
+// How many notes would drop out of the cloud AUTO backup if the manual-backup
+// count became `n` (=> smaller per-backup size cap). Packs the current notes
+// with the new cap - exactly what the next auto-backup will do - and compares
+// with what the existing auto backup already leaves out. 0 = nothing is lost.
+async function mu_cloudEstimateAutoLoss(n, autoEntry){
+    if (!autoEntry) return 0;
+    const per=cloudChunksPerSlot(n);
+    if ((autoEntry.chunks||0) <= per) return 0;
+    const packed=await cloudBuildPayload(per);
+    return Math.max(0, (packed.skipped||0) - (autoEntry.skipped||0));
+}
+
+async function markhinDash_cloudApplyLimitClick(){
+    const fa=currentLang==='fa';
+    const box=document.getElementById('cloudLimitBox');
+    const btn=document.getElementById('cloudApplyLimitBtn');
+    if(!box) return;
+    const n=cloudNormalizeManualLimit(box.dataset.pending);
+    if(n===null || n===MAX_MANUAL_BACKUPS) return;
+    if(btn) btn.disabled=true;
+    let list;
+    try { list=await cloudListBackups(); }
+    catch (e) { showToast(mu_cloudReasonMsg('unavailable', fa), 3200); if(btn) btn.disabled=false; return; }
+    const manualCount=list.filter(e=>e.kind==='manual').length;
+    if (manualCount>n) {
+        const ok=await mu_cloudConfirm(fa
+            ? `الان ${manualCount} بکاپ دستی داری. با تنظیم روی ${n}، قدیمی‌ترین ${manualCount-n} بکاپ دستی برای همیشه حذف می‌شود. ادامه می‌دهی؟`
+            : `You currently have ${manualCount} manual backups. Setting the limit to ${n} permanently deletes the oldest ${manualCount-n}. Continue?`);
+        if (!ok) { if(btn) btn.disabled=false; return; }
+    }
+    if (n>MAX_MANUAL_BACKUPS) {
+        // Raising the count shrinks every backup's size cap. If the current auto
+        // backup is bigger than the new cap and notes would no longer fit, warn first.
+        const autoEntry=list.find(e=>e.kind==='auto');
+        let lost=0;
+        try { lost=await mu_cloudEstimateAutoLoss(n, autoEntry); } catch (e) { lost=0; }
+        if (lost>0) {
+            const cur=mu_fmtCloudSize((autoEntry.chunks||0)*CLOUD_CHUNK_SIZE);
+            const cap=mu_fmtCloudSize(cloudChunksPerSlot(n)*CLOUD_CHUNK_SIZE);
+            const ok=await mu_cloudConfirm(fa
+                ? `بکاپ خودکار فعلی (${cur}) از سقف جدید (${cap}) بزرگ‌تر است. با این تنظیم حدود ${lost} یادداشت از بکاپ ابری خارج می‌شود (روی گوشی می‌مانند). بهتر است اول یک بکاپ دستی بگیری. ادامه می‌دهی؟`
+                : `The current auto backup (${cur}) is bigger than the new cap (${cap}). About ${lost} note(s) will drop out of the cloud backup (they stay on this device). Better take a manual backup first. Continue?`);
+            if (!ok) { if(btn) btn.disabled=false; return; }
+        }
+    }
+    showToast(fa?'در حال ذخیره‌ی تنظیمات…':'Saving settings…', 1500);
+    const res=await cloudApplyManualLimitChange(n);
+    if (!res.ok) {
+        showToast(mu_cloudReasonMsg(res.reason, fa), 3200);
+        await markhinDash_renderCloudPanelBody();
+        return;
+    }
+    // Re-run the auto backup so it immediately re-fits the new per-backup size cap
+    // (e.g. with 0 manual backups it can now hold far more notes).
+    scheduleCloudBackup();
+    showToast(fa
+        ? `✅ ذخیره شد — تعداد بکاپ دستی: ${n}${res.removed?` (${res.removed} بکاپ قدیمی حذف شد)`:''}`
+        : `✅ Saved — manual backups: ${n}${res.removed?` (${res.removed} old backup(s) deleted)`:''}`, 3200);
+    await markhinDash_renderCloudPanelBody();
+}
+window.markhinDash_cloudApplyLimitClick = markhinDash_cloudApplyLimitClick;
+
+// Full guide for the "Backup settings" block (opened by its "📖 Full guide" button).
+function markhinDash_showCloudSettingsHelp(){
+    const fa=currentLang==='fa';
+    let tableRows='';
+    for (let n=CLOUD_MANUAL_MIN;n<=CLOUD_MANUAL_MAX;n++) {
+        const size=mu_fmtCloudSize(cloudChunksPerSlot(n)*CLOUD_CHUNK_SIZE);
+        const cur=(n===MAX_MANUAL_BACKUPS);
+        tableRows += `<p style="margin:2px 0${cur?';font-weight:bold':''}">• ${
+            fa ? (n===0 ? `۰ بکاپ دستی: بکاپ خودکار تا ${size} (تمام فضا)` : `${n} بکاپ دستی: خودکار تا ${size} و هر دستی تا ${size}`)
+               : (n===0 ? `0 manual: auto backup up to ${size} (all the space)` : `${n} manual: auto up to ${size}, each manual up to ${size}`)
+        }${cur?(fa?' ← الان':' ← current'):''}</p>`;
+    }
+    const totalKeys=CLOUD_KEY_BUDGET;
+    const bodyHtml = fa ? `
+        <div style="font-size:12.5px;line-height:2">
+            <h4 style="margin:0 0 6px">🎯 این تنظیم چیست؟</h4>
+            <p>مشخص می‌کند چند «بکاپ دستی» (همان‌هایی که با دکمه‌ی «ذخیره‌ی یک بکاپ جدید» می‌سازی) هم‌زمان در Cloud تلگرام نگه داشته شود. همیشه یک «بکاپ خودکار» هم وجود دارد که خودش به‌روز می‌شود و جزو این عدد نیست.</p>
+            <h4 style="margin:14px 0 6px">🔢 محدوده و پیش‌فرض</h4>
+            <p>از ۰ تا ۷ قابل تنظیم است و پیش‌فرض ۳ است. یک عدد را انتخاب کن؛ پایین آن بلافاصله حجم تقریبی بکاپ خودکار و هر بکاپ دستی نوشته می‌شود. تا وقتی «ذخیره‌ی تنظیمات» را نزنی هیچ چیزی تغییر نمی‌کند و هیچ بکاپی حذف نمی‌شود.</p>
+            <h4 style="margin:14px 0 6px">📐 فضا چطور تقسیم می‌شود؟</h4>
+            <p>تلگرام برای هر ربات فقط ۱۰۲۴ کلید ذخیره‌سازی می‌دهد. برنامه عمداً فقط حدود ${totalKeys} کلید را مصرف می‌کند (حدود ۶۴ کلید حاشیه‌ی امن) و این تعداد ثابت است؛ ۲ کلید برای فهرست و تنظیمات کنار گذاشته می‌شود و بقیه بین بکاپ خودکار و بکاپ‌های دستی <b>مساوی</b> تقسیم می‌شود. پس هرچه بکاپ دستی بیشتری بخواهی، سقف حجم هر بکاپ کمتر می‌شود و برعکس:</p>
+            ${tableRows}
+            <h4 style="margin:14px 0 6px">0️⃣ اگر روی ۰ بگذارم؟</h4>
+            <p>بکاپ دستی غیرفعال می‌شود (دکمه‌ی ذخیره‌ی بکاپ جدید دیگر نشان داده نمی‌شود) و تقریباً تمام فضا (حدود ${totalKeys} کلید) فقط به بکاپ خودکار می‌رسد؛ یعنی بکاپ خودکار بزرگ‌ترین حالت ممکن را دارد و یادداشت‌های بیشتری در آن جا می‌شود.</p>
+            <h4 style="margin:14px 0 6px">➖ کم‌کردن تعداد</h4>
+            <p>اگر عدد را از تعداد بکاپ‌های دستیِ فعلی کمتر کنی، قبل از ذخیره یک تأییدیه می‌گیرد و بعد <b>قدیمی‌ترین</b> بکاپ‌های اضافه برای همیشه حذف می‌شوند. سقف حجم هر بکاپ بیشتر می‌شود و بکاپ خودکار بلافاصله دوباره ذخیره می‌شود تا از فضای بیشتر استفاده کند.</p>
+            <h4 style="margin:14px 0 6px">➕ زیادکردن تعداد</h4>
+            <p>هیچ بکاپی حذف نمی‌شود، اما سقف حجم هر بکاپ کمتر می‌شود. بکاپ خودکار در ذخیره‌ی بعدی به سقف جدید می‌رسد؛ اگر یادداشت‌هایت از آن سقف بزرگ‌تر باشند، در بکاپ خودکار یادداشت‌هایی که مدت‌هاست ویرایش نشده‌اند جا نمی‌گیرند (در لیست با ⚠️ نشان داده می‌شود). بکاپ‌های دستیِ قبلی همان‌طور که هستند می‌مانند. اگر بکاپ خودکار فعلی از سقف جدید بزرگ‌تر باشد و با ذخیره‌ی تنظیم یادداشتی از بکاپ ابری بیرون بماند، قبل از ذخیره یک تأییدیه‌ی هشدار می‌گیری؛ بهتر است در آن حالت اول یک بکاپ دستی بگیری.</p>
+            <h4 style="margin:14px 0 6px">📏 «حجم تقریبی» یعنی چه؟</h4>
+            <p>حداکثر مقدار متنِ ذخیره‌شده در Cloud تلگرام است (هر ۱ کیلوبایت ≈ ۱۰۰۰ کاراکتر). چون محتوا قبل از ذخیره فشرده می‌شود، معمولاً چند برابر این مقدار یادداشت در آن جا می‌شود. عددی که کنار هر بکاپ در لیست می‌بینی، حجمِ واقعیِ همان بکاپ است، نه سقف.</p>
+            <h4 style="margin:14px 0 6px">🔁 همگام‌سازی بین دستگاه‌ها</h4>
+            <p>این تنظیم هم مثل خودِ بکاپ‌ها در Cloud تلگرام ذخیره می‌شود؛ پس روی همه‌ی دستگاه‌هایی که همین ربات را با همین حساب باز می‌کنی یکسان است.</p>
+            <h4 style="margin:14px 0 6px">🛠 پیام «فضای Cloud کافی نیست»</h4>
+            <p>اگر بعد از زیادکردن تعداد، بکاپ‌های قدیمیِ بزرگ هنوز جا را پر کرده باشند، ممکن است ذخیره‌ی بکاپ دستی جدید با این پیام رد شود. یکی از بکاپ‌های دستیِ قدیمی را حذف کن و دوباره امتحان کن. هیچ داده‌ای بی‌خبر پاک نمی‌شود.</p>
+            <h4 style="margin:14px 0 6px">⚠️ یادآوری</h4>
+            <p>فقط متن و اطلاعات یادداشت‌ها بکاپ می‌شود؛ تصاویر همیشه فقط روی همان دستگاه می‌مانند.</p>
+        </div>`
+    : `
+        <div style="font-size:12.5px;line-height:2">
+            <h4 style="margin:0 0 6px">🎯 What is this setting?</h4>
+            <p>It sets how many manual backups (the ones you create with "Save a new backup") are kept in Telegram Cloud at the same time. There is always one automatic backup as well, which updates itself and is not counted in this number.</p>
+            <h4 style="margin:14px 0 6px">🔢 Range and default</h4>
+            <p>You can choose from 0 to 7; the default is 3. Pick a number and the approximate size of the auto backup and of each manual backup is shown right below it. Nothing changes and no backup is deleted until you press "Save settings".</p>
+            <h4 style="margin:14px 0 6px">📐 How is the space split?</h4>
+            <p>Telegram gives each bot only 1024 storage keys. The app deliberately uses at most about ${totalKeys} of them (roughly 64 keys of safety margin), and this is fixed. 2 keys are reserved for the index and settings; the rest is split <b>equally</b> between the auto backup and the manual backups. So the more manual backups you want, the smaller each backup's size cap, and vice versa:</p>
+            ${tableRows}
+            <h4 style="margin:14px 0 6px">0️⃣ What if I set it to 0?</h4>
+            <p>Manual backups are turned off (the "Save a new backup" button is hidden) and almost all the space (about ${totalKeys} keys) goes to the auto backup alone, so it can hold as many notes as possible.</p>
+            <h4 style="margin:14px 0 6px">➖ Lowering the number</h4>
+            <p>If you set it below the number of manual backups you have, you are asked to confirm first, and then the <b>oldest</b> extra backups are permanently deleted. Each backup's size cap grows, and the auto backup re-saves right away to use the extra space.</p>
+            <h4 style="margin:14px 0 6px">➕ Raising the number</h4>
+            <p>Nothing is deleted, but each backup's size cap gets smaller. The auto backup reaches the new cap on its next save; if your notes are bigger than that, the least recently edited ones won't fit into the auto backup (shown with ⚠️ in the list). Existing manual backups stay exactly as they are. If the current auto backup is bigger than the new cap and some notes would drop out of the cloud backup, you get a warning confirmation before saving; in that case it is best to take a manual backup first.</p>
+            <h4 style="margin:14px 0 6px">📏 What does "approximate size" mean?</h4>
+            <p>It is the maximum amount of text stored in Telegram Cloud (1 KB ≈ 1000 characters). Because content is compressed before saving, several times that much note text usually fits. The number next to each backup in the list is that backup's real size, not the cap.</p>
+            <h4 style="margin:14px 0 6px">🔁 Sync across devices</h4>
+            <p>This setting is stored in Telegram Cloud just like the backups, so it is the same on every device where you open this bot with the same account.</p>
+            <h4 style="margin:14px 0 6px">🛠 "Not enough Cloud space" message</h4>
+            <p>After raising the number, large older backups may still fill the space, and saving a new manual backup can be refused with this message. Delete one of the older manual backups and try again. Nothing is ever deleted without you knowing.</p>
+            <h4 style="margin:14px 0 6px">⚠️ Reminder</h4>
+            <p>Only note text/metadata is backed up; images always stay on the device that has them.</p>
+        </div>`;
+    showAdvanced(markhinDash_headHtml(`📖 ${fa?'راهنمای کامل تنظیمات بکاپ':'Backup settings guide'}`,true,'markhinDash_showCloudPanel()') + bodyHtml);
+}
+window.markhinDash_showCloudSettingsHelp = markhinDash_showCloudSettingsHelp;
 
 async function markhinDash_cloudBackupClick(){
     const fa=currentLang==='fa';
@@ -17176,9 +17855,7 @@ async function markhinDash_cloudBackupClick(){
         // Upgrade: surface the actual reason (was a single generic message for
         // every failure, which made 'unavailable' — e.g. CloudStorage dropped
         // mid-session — indistinguishable from a real write failure worth retrying).
-        const reasonMsg = res.reason === 'unavailable'
-            ? (fa ? '⚠️ Cloud تلگرام در دسترس نیست. دوباره ربات را باز کن.' : '⚠️ Telegram Cloud is unavailable right now. Try reopening the bot.')
-            : (fa ? '⚠️ نوشتن در Cloud تلگرام ناموفق بود. دوباره امتحان کن.' : '⚠️ Writing to Telegram Cloud failed. Please try again.');
+        const reasonMsg = mu_cloudReasonMsg(res.reason, fa);
         showToast(reasonMsg, 3200);
         if(btn) btn.disabled=false;
     }
@@ -17196,7 +17873,9 @@ window.markhinDash_cloudBackupClick = markhinDash_cloudBackupClick;
 function mu_cloudConfirm(message) {
     return new Promise((resolve) => {
         if (IS_TELEGRAM && TG && typeof TG.showConfirm === 'function') {
-            try { TG.showConfirm(message, (ok) => resolve(!!ok)); return; }
+            // showConfirm() throws for messages over 256 characters.
+            const tgMsg = String(message).length > 256 ? String(message).slice(0, 253) + '…' : String(message);
+            try { TG.showConfirm(tgMsg, (ok) => resolve(!!ok)); return; }
             catch (e) { /* fall through to plain confirm below */ }
         }
         try { resolve(confirm(message)); } catch (e) { resolve(false); }
@@ -17237,8 +17916,8 @@ async function markhinDash_cloudDeleteClick(id){
     const ok = await mu_cloudConfirm(fa ? 'این بکاپ برای همیشه حذف می‌شود. ادامه می‌دهی؟' : 'This backup will be permanently deleted. Continue?');
     if (!ok) return;
     showToast(fa?'در حال حذف...':'Deleting...', 1200);
-    await cloudDeleteBackup(id);
-    showToast(fa?'🗑 بکاپ حذف شد.':'🗑 Backup deleted.', 2000);
+    const deleted = await cloudDeleteBackup(id);
+    showToast(deleted ? (fa?'🗑 بکاپ حذف شد.':'🗑 Backup deleted.') : mu_cloudReasonMsg('write-failed', fa), 2400);
     markhinDash_showCloudPanel();
 }
 window.markhinDash_cloudDeleteClick = markhinDash_cloudDeleteClick;
@@ -17247,26 +17926,39 @@ async function markhinDash_cloudRestoreClick(id){
     const fa=currentLang==='fa';
     const result = await cloudRestoreBackup(id);
     if (!result) { showToast(fa?'این بکاپ پیدا نشد یا خراب است.':'This backup could not be found or is corrupted.', 2600); return; }
-    const backupDesc = result.meta.label
-        ? (fa ? `«${result.meta.label}» (${mu_fmtCloudDate(result.meta.ts)})` : `"${result.meta.label}" (${mu_fmtCloudDate(result.meta.ts)})`)
-        : mu_fmtCloudDate(result.meta.ts);
+    const when = mu_fmtCloudDate(result.meta.ts);
+    const shortLabel = result.meta.label ? String(result.meta.label).slice(0, 40) : '';
+    const backupDesc = shortLabel
+        ? (fa ? `«${shortLabel}» (${when})` : `"${shortLabel}" (${when})`)
+        : when;
+    // Bug fix: Telegram's showConfirm() only accepts messages up to 256 characters and throws
+    // on longer ones — the old (much longer) text always fell through to the native confirm()
+    // this helper exists to avoid, which many Telegram WebViews suppress (restore then did nothing).
     const ok = await mu_cloudConfirm(fa
-        ? `${result.data.notes.length} یادداشت متنی از این بکاپ (${backupDesc}) بازیابی می‌شود.\nیادداشت‌هایی که همین‌جا هم وجود دارند (با شناسه یکسان) فقط در صورتی به‌روزرسانی می‌شوند که نسخه‌ی بکاپ جدیدتر باشد؛ تصاویرشان دست‌نخورده می‌ماند. یادداشت‌های جدید اضافه می‌شوند. ادامه می‌دهی؟`
-        : `${result.data.notes.length} text notes will be restored from this backup (${backupDesc}).\nNotes that already exist here (same id) are only updated if the backup copy is newer — their images are left untouched. New notes are added. Continue?`);
+        ? `${result.data.notes.length} یادداشت از ${backupDesc} بازیابی شود؟ یادداشت‌های جدید اضافه می‌شوند و فقط نسخه‌های قدیمی‌تر از بکاپ به‌روز می‌شوند (تصاویر حفظ می‌شود).`
+        : `Restore ${result.data.notes.length} notes from ${backupDesc}? New notes are added; only copies older than the backup are updated (images are kept).`);
     if (!ok) return;
 
     let updated = 0, added = 0;
     result.data.notes.forEach(cloudItem => {
+        if (!cloudItem || typeof cloudItem !== 'object') return;
         const local = categories.find(c => c.id === cloudItem.id);
         if (local) {
             if ((Date.parse(cloudItem.lastEdited) || 0) > (Date.parse(local.lastEdited) || 0)) {
                 local.name = cloudItem.name; local.folder = cloudItem.folder;
-                local.tags = cloudItem.tags;
-                local.pinned = cloudItem.pinned; local.favorite = cloudItem.favorite; local.archived = !!cloudItem.archived;
+                local.tags = Array.isArray(cloudItem.tags) ? cloudItem.tags.filter(Boolean).map(String) : (local.tags || []);
+                local.pinned = !!cloudItem.pinned; local.favorite = !!cloudItem.favorite; local.archived = !!cloudItem.archived;
                 if (cloudItem.order != null) local.order = Number(cloudItem.order) || 0;
                 if (cloudItem.fontFamily) local.fontFamily = cloudItem.fontFamily;
                 if (cloudItem.fontSize) local.fontSize = Number(cloudItem.fontSize) || local.fontSize;
                 if (Array.isArray(cloudItem.titleHistory)) local.titleHistory = cloudItem.titleHistory;
+                // Fields added to the backup later: only applied when the backup carries them,
+                // so restoring an older backup never wipes them.
+                if (typeof cloudItem.fakeContent === 'string') local.fakeContent = cloudItem.fakeContent;
+                if (cloudItem.unlockAt !== undefined) local.unlockAt = cloudItem.unlockAt;
+                if (cloudItem.ghostUntil !== undefined) local.ghostUntil = cloudItem.ghostUntil;
+                if (cloudItem.decayLevel !== undefined) local.decayLevel = Number(cloudItem.decayLevel) || 0;
+                if (cloudItem.decayManual !== undefined) local.decayManual = !!cloudItem.decayManual;
                 local.lastEdited = cloudItem.lastEdited;
                 if (isNoteLocked(cloudItem)) {
                     // Never let a cloud restore replace encrypted content with an
@@ -17279,10 +17971,19 @@ async function markhinDash_cloudRestoreClick(id){
                     unlockedQaIds = unlockedQaIds.filter(id => id !== local.id);
                 } else {
                     local.encrypted = null;
+                    const prevText = local.text;
                     local.text = cloudItem.text;
-                    // Only take the cloud HTML if the local note has no images of its
-                    // own to lose — otherwise keep the local copy (with its images).
-                    if (!/<img|img-drag-wrapper/.test(local.html || '')) local.html = sanitizeHtml(cloudItem.html || cloudItem.text || '');
+                    // Bug fix: if the local note had images, only its text used to be replaced
+                    // while the old HTML stayed — text and displayed content disagreed and the
+                    // restore looked like it did nothing. Now the newer cloud content is used and
+                    // the local images / voice notes are put back where their placeholders are.
+                    const cloudHtml = sanitizeHtml(cloudItem.html || cloudItem.text || '');
+                    if (cloudHtmlHasMedia(local.html)) {
+                        try { local.html = sanitizeHtml(cloudMergeKeepMedia(cloudHtml, local.html)); }
+                        catch (e) { console.warn('cloud restore: media merge failed, keeping local body', e); local.text = prevText; }
+                    } else {
+                        local.html = cloudHtml;
+                    }
                 }
                 updated++;
             }
@@ -17294,13 +17995,25 @@ async function markhinDash_cloudRestoreClick(id){
             added++;
         }
     });
-    (result.data.folders || []).forEach(f => { if (f && !folders.includes(f)) folders.push(f); });
+    (result.data.folders || []).forEach(f => { if (typeof f === 'string' && f && !folders.includes(f)) folders.push(f); });
+    cloudSetLinked();
     saveToLocalStorage(); saveFoldersToLocalStorage();
-    showToast(fa ? `✅ بازیابی انجام شد — ${added} یادداشت جدید، ${updated} یادداشت به‌روزرسانی شد.` : `✅ Restored — ${added} new, ${updated} updated.`, 3600);
+    if (added || updated) {
+        showToast(fa ? `✅ بازیابی انجام شد — ${added} یادداشت جدید، ${updated} یادداشت به‌روزرسانی شد.` : `✅ Restored — ${added} new, ${updated} updated.`, 3600);
+    } else {
+        showToast(fa ? 'ℹ️ تغییری لازم نبود؛ یادداشت‌های این دستگاه از بکاپ جدیدتر یا برابرند.' : 'ℹ️ Nothing to change; the notes on this device are already as new as this backup.', 3600);
+    }
     closeAdvancedModal();
     renderApp();
 }
 window.markhinDash_cloudRestoreClick = markhinDash_cloudRestoreClick;
+// The AI-assistant tools (a separate script) and other blocks call these by name, but they
+// live inside this closure — exposing them fixes "mu_fmtCloudDate is not defined" in the
+// telegram_backup_create/list/delete tools.
+window.mu_fmtCloudDate = mu_fmtCloudDate;
+window.mu_cloudReasonMsg = mu_cloudReasonMsg;
+window.mu_cloudConfirm = mu_cloudConfirm;
+window.markhinDash_renderCloudPanelBody = markhinDash_renderCloudPanelBody;
 
 return {
     showMain: markhinDashboardMain,
@@ -23597,7 +24310,7 @@ window.MonsterHunt = (function(){
     let meter = null;        // adaptive-quality frame monitor (see MU_Perf)
     // Independent audio mix: background music vs one-shot SFX, each with its
     // own on/off + 0-100 volume, on top of the pre-existing master mute.
-    let audioMix = { musicOn: true, musicVol: 65, sfxOn: true, sfxVol: 80 };
+    let audioMix = { musicOn: true, musicVol: 92, sfxOn: true, sfxVol: 80 };
     let settingsPausedPlay = false;
     // HUD "last shown" values — the DOM is only touched when something really changed.
     let shownScore = -1, shownCenter = null, shownStun = false, warnOn = false, warnTxt = null;
@@ -23742,8 +24455,8 @@ window.MonsterHunt = (function(){
         const filt = c.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = 2000;
         osc.type = 'triangle'; osc.frequency.setValueAtTime(freq, t);
         gain.gain.setValueAtTime(0, t);
-        gain.gain.linearRampToValueAtTime(0.07, t + dur * 0.25);
-        gain.gain.linearRampToValueAtTime(0.045, t + dur * 0.65);
+        gain.gain.linearRampToValueAtTime(0.15, t + dur * 0.25);
+        gain.gain.linearRampToValueAtTime(0.10, t + dur * 0.65);
         gain.gain.linearRampToValueAtTime(0, t + dur);
         osc.connect(filt).connect(gain).connect(musicBus || c.destination);
         osc.start(t); osc.stop(t + dur + 0.03);
@@ -23753,7 +24466,7 @@ window.MonsterHunt = (function(){
         const osc = c.createOscillator(), gain = c.createGain();
         osc.type = 'sine'; osc.frequency.setValueAtTime(freq, t);
         gain.gain.setValueAtTime(0, t);
-        gain.gain.linearRampToValueAtTime(0.09, t + 0.3);
+        gain.gain.linearRampToValueAtTime(0.19, t + 0.3);
         gain.gain.exponentialRampToValueAtTime(0.001, t + MUS_STEP * 15);
         osc.connect(gain).connect(musicBus || c.destination);
         osc.start(t); osc.stop(t + MUS_STEP * 16);
@@ -23764,8 +24477,8 @@ window.MonsterHunt = (function(){
         const dur = MUS_STEP * 16 * 1.1;
         const filt = c.createBiquadFilter(); filt.type = 'lowpass'; filt.frequency.value = 700;
         const gain = c.createGain(); gain.gain.setValueAtTime(0, t);
-        gain.gain.linearRampToValueAtTime(0.04, t + dur * 0.4);
-        gain.gain.linearRampToValueAtTime(0.04, t + dur * 0.75);
+        gain.gain.linearRampToValueAtTime(0.09, t + dur * 0.4);
+        gain.gain.linearRampToValueAtTime(0.09, t + dur * 0.75);
         gain.gain.linearRampToValueAtTime(0, t + dur);
         filt.connect(gain).connect(musicBus || c.destination);
         freqs.forEach(function(f, i){
@@ -30447,7 +31160,7 @@ function tdMelodyNote(step, t0){
         const g2 = c.createGain(); g2.gain.value = 0.16;
         o2.connect(g2); g2.connect(g); o1.connect(g); g.connect(lp); lp.connect(musicGain || master);
         g.gain.setValueAtTime(0.0001, t0);
-        g.gain.exponentialRampToValueAtTime(0.09, t0 + 0.12);
+        g.gain.exponentialRampToValueAtTime(0.26, t0 + 0.12);
         g.gain.exponentialRampToValueAtTime(0.0001, t0 + 3.4);
         o1.start(t0); o1.stop(t0 + 3.5);
         o2.start(t0); o2.stop(t0 + 3.5);
@@ -30467,10 +31180,8 @@ function startDrone(){
     try {
         const myGen = ++droneGen;
         const g = c.createGain(); g.gain.value = 0.0001;
-        // Louder overall envelope than before — the old 0.055 ceiling read as
-        // near-silent under the game's SFX; this is the main fix for "can't
-        // hear the music".
-        g.gain.exponentialRampToValueAtTime(0.16, c.currentTime + 3.5);
+        // Fourth pass on this envelope (0.16 -> 0.26 -> 0.36 -> 0.5).
+        g.gain.exponentialRampToValueAtTime(0.5, c.currentTime + 3.5);
         const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 320; lp.Q.value = 1.1;
         // Warm, mellow pad: soft sines a fifth apart (A2 + E3) plus a gently
         // shimmering triangle a touch out of tune, instead of the old harsh
@@ -30622,7 +31333,7 @@ let winStats = { time: 0 };
 const AUDIOMIX_KEY = 'markhin_trapdevil_audiomix_v1';
 // Independent audio mix: background music vs one-shot SFX, each with its own
 // on/off + 0-100 volume, on top of the pre-existing master mute.
-let audioMix = { musicOn: true, musicVol: 70, sfxOn: true, sfxVol: 80 };
+let audioMix = { musicOn: true, musicVol: 100, sfxOn: true, sfxVol: 80 };
 let settingsPausedPlay = false; // true if opening Settings paused an in-progress run
 
 const input = { left: false, right: false, jump: false, jumpBuf: 0 };
@@ -39606,7 +40317,7 @@ const MU_AI = (function(){
         { name:'find_contradictions', description:"Scan the user's notes for statements that may CONTRADICT each other - e.g. \"here you wrote X but somewhere else you wrote the opposite\" (likes vs hates something, always vs never, one number vs a different number for the same thing) - across different notes and, by default, inside a single note too. Similar to find_duplicate_notes but for conflicting rather than overlapping content. Returns candidate pairs of sentences with both notes' ids, names and last-edited dates, the conflict signals, and the shared topic words. These are heuristic CANDIDATES, not verified contradictions: you must read each pair yourself and tell the user honestly which are real conflicts, which are merely a change of mind or circumstances over time (compare the dates), and which are false alarms. It changes nothing by itself - offer edit_note_content or merge_notes afterward only if the user wants to resolve one.", parameters:{ type:'object', properties:{ topic:{ type:'string', description:"Optional: only look at sentences about this topic (e.g. \"sleep\" or \"بودجه\")." }, folder:{ type:'string', description:"Optional: only scan notes in this folder." }, include_same_note:{ type:'boolean', description:"Also look for contradictions inside a single note (default true)." }, include_archived:{ type:'boolean', description:"Also scan archived notes (default false)." }, max_pairs:{ type:'number', description:"Maximum number of note pairs to return (default 12, max 25)." } } } },
         { name:'semantic_search_notes', description:"Find notes by MEANING rather than exact words - e.g. \"the note where I wrote about missing my student days\" should be found even if it never contains the word \"missing\". You are the semantic engine: BEFORE calling, brainstorm 15-30 related_terms for what the user describes - synonyms, close concepts, and the typical words, situations, places, people and emotions that go with it (both Persian and English forms when notes might mix languages). The tool ranks the user's unlocked notes by those terms (title and tag hits count more, rarer terms count more) and returns the best notes with matched terms, the best-matching passage and the note opening. The ranking is only a term-based pre-filter: YOU then judge the passages by real meaning and present only the notes that truly fit, saying briefly why. If results are weak the response also includes overviewOfOtherNotes (title + preview of other notes) so you can still pick by meaning, or you can call again with different related_terms. For a plain exact-word lookup use find_notes instead.", parameters:{ type:'object', properties:{ query:{ type:'string', description:"The user's own description of what they are looking for, in their own words." }, related_terms:{ type:'array', items:{ type:'string' }, description:"15-30 related words or short phrases YOU generate: synonyms, related concepts, typical vocabulary of the situation, in Persian and/or English." }, folder:{ type:'string', description:"Optional: only search notes in this folder." }, include_archived:{ type:'boolean', description:"Also search archived notes (default false)." }, limit:{ type:'number', description:"Max results (default 8, max 15)." } }, required:['query','related_terms'] } },
         { name:'telegram_backup_create', description:"Create a REAL manual Telegram Cloud backup of the user's notes right now — the exact same engine as the Dashboard's ☁️ Cloud Backup panel's \"Save a new backup\" button (Telegram.WebApp.CloudStorage), NOT a downloaded file and NOT the app's export_notes tool. Call this whenever the user asks, in ANY language, spelling, misspelling, or Finglish, to back up their notes/telegram/the app — recognize all of these and similar: Persian 'بکاپ بگیر', 'یه بکاپ تلگرام بگیر', 'از یادداشتام بکاپ بگیر', 'بکاپ کن', 'بکاپ گیری کن', 'ذخیره کن تو کلود تلگرام', 'یه نسخه پشتیبان بگیر'; Finglish 'backup begir', 'baram backup begir', 'telegram backup begir', 'ye backup az yaddashtam begir'; English 'back up my notes', 'make/take a telegram backup', 'save a cloud backup', 'create a backup', 'backup my notes'. If the user gives an explicit name/label for this backup (e.g. \"با اسم/برچسب X\", \"به نام X\", \"named X\", \"label it X\", \"call it X\"), pass that exact text as label. If the user does NOT give a name, leave label empty/omitted — the tool automatically generates one itself in the format \"Backup <current date & time>\" (the date shown in whichever calendar matches the app's own current language — Jalali for Persian, Gregorian for English — and the exact time read from the user's own device clock); never invent or compute a date/time string yourself. This creates a genuinely separate, persistent manual snapshot kept until deleted — distinct from the automatic backup slot that silently overwrites itself after every edit. Only works while running inside Telegram with Telegram Cloud Storage available; if the tool returns ok:false for that reason, tell the user plainly instead of pretending it worked. Up to " + MAX_MANUAL_BACKUPS + " manual backups can exist at once — saving one more than that automatically removes the oldest, which the tool result reflects.", parameters:{ type:'object', properties:{ label:{ type:'string', description:'Optional short label/name for this backup, using whatever wording the user gave. Leave empty to auto-generate a "Backup <date & time>" label.' } } } },
-        { name:'telegram_backup_list', description:"List the user's existing Telegram Cloud backups: the one automatic slot (always reflects the latest note state) plus up to " + MAX_MANUAL_BACKUPS + " manual snapshots, each with its id, label (if any), date/time, note count, and approximate size. Call this whenever the user asks what backups they have, in ANY language/spelling/Finglish — Persian 'لیست بکاپ‌ها', 'چه بکاپ‌هایی دارم', 'چند تا بکاپ دارم', 'بکاپ‌هام رو نشون بده'; Finglish 'backup list', 'chand ta backup daram'; English 'list my backups', 'show my telegram backups', 'what backups do I have'. Also call this FIRST whenever you need a manual backup's exact id before calling telegram_backup_delete and you don't already have it from context.", parameters:{ type:'object', properties:{} } },
+        { name:'telegram_backup_list', description:"List the user's existing Telegram Cloud backups: the one automatic slot (always reflects the latest note state) plus up to the user's configured number (0-7, default 3) of manual snapshots, each with its id, label (if any), date/time, note count, and approximate size. Call this whenever the user asks what backups they have, in ANY language/spelling/Finglish — Persian 'لیست بکاپ‌ها', 'چه بکاپ‌هایی دارم', 'چند تا بکاپ دارم', 'بکاپ‌هام رو نشون بده'; Finglish 'backup list', 'chand ta backup daram'; English 'list my backups', 'show my telegram backups', 'what backups do I have'. Also call this FIRST whenever you need a manual backup's exact id before calling telegram_backup_delete and you don't already have it from context.", parameters:{ type:'object', properties:{} } },
         { name:'telegram_backup_delete', description:"Permanently delete ONE manual Telegram Cloud backup — never the automatic slot, which cannot be deleted on its own since it isn't a real snapshot. This always shows the user a real confirmation dialog first and only deletes if they accept, so it is safe to call as soon as the user clearly asks to delete/remove a specific manual backup, in ANY language/spelling/Finglish — Persian 'بکاپ ... رو حذف کن', 'اون بکاپ رو پاک کن', 'بکاپ دستی رو حذف کن'; Finglish 'backup ro hazf kon', 'backup ro pak kon'; English 'delete that backup', 'remove the backup named X', 'delete my manual backup' — but never call it just to be helpful when deletion was not requested. Identify the backup either by its exact id (call telegram_backup_list first if you don't already know it) or by giving label_or_date with whatever text/date the user used to refer to it — if that text matches more than one backup, this returns the candidate list instead of deleting anything so you can ask the user which one they mean, and if it is empty/omitted along with id, mention every manual backup's label and id from a telegram_backup_list result yourself and ask the user which to delete.", parameters:{ type:'object', properties:{ id:{ type:'string', description:'The exact backup id, from telegram_backup_list.' }, label_or_date:{ type:'string', description:'Text to match against the backup label or shown date/time, when the exact id is not known.' } } } }
     ];
 
@@ -41539,9 +42250,7 @@ const MU_AI = (function(){
                     const label = rawLabel || autoLabel;
                     const res = await cloudBackupNow('manual', label);
                     if(!res.ok){
-                        const reasonMsg = res.reason === 'unavailable'
-                            ? (fa ? 'Cloud تلگرام در دسترس نیست. کاربر باید ربات را دوباره باز کند.' : 'Telegram Cloud is unavailable right now. The user should try reopening the bot.')
-                            : (fa ? 'نوشتن در Cloud تلگرام ناموفق بود.' : 'Writing to Telegram Cloud failed.');
+                        const reasonMsg = mu_cloudReasonMsg(res.reason, fa);
                         return { ok:false, error: reasonMsg };
                     }
                     showToast(fa
@@ -41560,6 +42269,7 @@ const MU_AI = (function(){
                             ? 'بکاپ‌های تلگرام فقط داخل تلگرام و وقتی Telegram Cloud Storage در دسترس باشد قابل مشاهده‌اند؛ الان در دسترس نیست.'
                             : 'Telegram backups are only available inside Telegram with Telegram Cloud Storage; it is not available right now.' };
                     }
+                    await cloudLoadSettings(false);
                     const list = await cloudListBackups();
                     const data = list.map(e => ({
                         id: e.id, kind: e.kind, label: e.label || null, notes: e.notes, skipped: e.skipped || 0,
@@ -41607,7 +42317,8 @@ const MU_AI = (function(){
                     if(!confirmed){
                         return { ok:false, cancelled:true, error: fa ? 'کاربر حذف بکاپ را در پنجره تأیید لغو کرد.' : 'The user cancelled the backup deletion in the confirmation dialog.' };
                     }
-                    await cloudDeleteBackup(target.id);
+                    const delOk = await cloudDeleteBackup(target.id);
+                    if(!delOk){ return { ok:false, error: mu_cloudReasonMsg('write-failed', fa) }; }
                     showToast(fa?'🗑 بکاپ حذف شد.':'🗑 Backup deleted.', 2000);
                     if(document.getElementById('cloudPanelBody')) markhinDash_renderCloudPanelBody();
                     return { ok:true, data:{ id: target.id, label: target.label || null, dateLabel: mu_fmtCloudDate(target.ts) } };
