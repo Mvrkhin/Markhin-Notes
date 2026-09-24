@@ -12513,6 +12513,42 @@ window.mu_syncHtmlBg = function(){
             }
         }
 
+        /* Per-text direction for single-line inputs (password prompt + hint fields).
+           The first STRONG character decides: Persian/Arabic -> rtl, English -> ltr.
+           Neutral characters such as "@" at the start are skipped, so "@user (راهنما)"
+           is laid out left-to-right and the "@" stays at the left edge of the text.
+           The input's own value decides while typing; while it is empty the
+           placeholder text (the password hint) decides. */
+        function muDetectTextDir(s) {
+            const RTL = /[\u0590-\u05FF\u0600-\u065F\u066A-\u06EF\u06FA-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFF]/;
+            const LTR = /[A-Za-z\u00C0-\u02B8\u0370-\u058F\u1E00-\u1FFF]/;
+            for (const ch of String(s || '')) {
+                if (RTL.test(ch)) return 'rtl';
+                if (LTR.test(ch)) return 'ltr';
+            }
+            return '';
+        }
+        function muBindAutoDir(input, emptyText, forceLtr) {
+            if (!input) return;
+            const emptyDir = emptyText ? (muDetectTextDir(emptyText) || 'ltr') : '';
+            const apply = () => {
+                // Password fields: whatever is typed is always laid out left-to-right,
+                // identical in hidden (dots) and visible (eye) mode.
+                const d = input.value
+                    ? (forceLtr ? 'ltr' : (muDetectTextDir(input.value) || 'ltr'))
+                    : emptyDir;
+                if (d) { input.setAttribute('dir', d); input.style.direction = d; }
+                else { input.removeAttribute('dir'); input.style.direction = ''; }
+                // Hidden mode shows only dots (direction-neutral); force LTR order so it
+                // behaves exactly like the visible mode. Never applied while empty, so the
+                // hint placeholder keeps its own per-text direction.
+                input.style.unicodeBidi = (forceLtr && input.value && input.type === 'password') ? 'bidi-override' : '';
+            };
+            input.addEventListener('input', apply);
+            input._muApplyDir = apply;
+            apply();
+        }
+
         function promptNotePassword(item, actionText = '') {
             return new Promise(resolve => {
                 const fa = currentLang === 'fa';
@@ -12559,6 +12595,7 @@ window.mu_syncHtmlBg = function(){
                     const x = document.getElementById(uid + '_x');
                     const eye = document.getElementById(uid + '_eye');
                     if (input) input.focus();
+                    muBindAutoDir(input, hintText, true);
                     const submit = () => finish(input ? input.value : '');
                     if (input) input.addEventListener('keydown', e => {
                         if (e.key === 'Enter') { e.preventDefault(); submit(); }
@@ -12570,6 +12607,7 @@ window.mu_syncHtmlBg = function(){
                         input.type = showing ? 'password' : 'text';
                         eye.textContent = showing ? '👁️' : '🙈';
                         eye.title = showing ? (fa ? 'نمایش رمز' : 'Show password') : (fa ? 'مخفی کردن رمز' : 'Hide password');
+                        if (input._muApplyDir) input._muApplyDir();
                         input.focus();
                     };
                     if (ok) ok.onclick = submit;
@@ -12632,6 +12670,7 @@ window.mu_syncHtmlBg = function(){
                     const x = document.getElementById(uid + '_x');
                     const eye = document.getElementById(uid + '_eye');
                     if (input) { input.focus(); if (!multiline && input.select) input.select(); }
+                    if (input && (opts.autoDir || isPassword)) muBindAutoDir(input, opts.placeholder, isPassword);
                     const submit = () => finish(input ? input.value : '');
                     if (input) input.addEventListener('keydown', e => {
                         if (e.key === 'Enter' && !multiline) { e.preventDefault(); submit(); }
@@ -12643,6 +12682,7 @@ window.mu_syncHtmlBg = function(){
                         input.type = showing ? 'password' : 'text';
                         eye.textContent = showing ? '👁️' : '🙈';
                         eye.title = showing ? (fa ? 'نمایش رمز' : 'Show password') : (fa ? 'مخفی کردن رمز' : 'Hide password');
+                        if (input._muApplyDir) input._muApplyDir();
                         input.focus();
                     };
                     if (ok) ok.onclick = submit;
@@ -12767,6 +12807,7 @@ window.mu_syncHtmlBg = function(){
                 const hint = (await promptStyledText({
                     title: fa ? '💡 راهنمای رمز (اختیاری)' : '💡 Password hint (optional)',
                     placeholder: i18n[currentLang].promptHint,
+                    autoDir: true,
                     okText: fa ? '✔️ تایید' : '✔️ OK'
                 })) || "";
                 const item = categories.find(c => c.id === id);
@@ -12795,6 +12836,7 @@ window.mu_syncHtmlBg = function(){
             const newHint = await promptStyledText({
                 title: fa ? '💡 راهنمای رمز' : '💡 Password hint',
                 placeholder: i18n[currentLang].promptHint,
+                autoDir: true,
                 defaultValue: item.hint || "",
                 okText: fa ? '✔️ ذخیره' : '✔️ Save'
             });
@@ -44846,11 +44888,52 @@ input[data-mu-at], textarea[data-mu-at] {
         if (box) refreshBoxCaret(box);
     }, true);
 
+    // Re-marking after (re)render. Saving a note rebuilds its .text-box from the
+    // stored HTML, and sanitizeHtml() drops the data-mu-at marks, so a note that
+    // starts with "@" lost its left-to-right layout right after saving. Watch for
+    // boxes being created or their content being replaced and mark them again.
+    var pendingBoxes = new Set();
+    var flushQueued = false;
+    function flushBoxes(){
+        flushQueued = false;
+        var list = Array.from(pendingBoxes);
+        pendingBoxes.clear();
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].isConnected) refreshBoxAll(list[i]);
+        }
+    }
+    function queueBox(box){
+        if (!box) return;
+        pendingBoxes.add(box);
+        if (!flushQueued) { flushQueued = true; requestAnimationFrame(flushBoxes); }
+    }
+    function startObserver(){
+        if (!window.MutationObserver || !document.body) return;
+        new MutationObserver(function(records){
+            for (var i = 0; i < records.length; i++) {
+                var r = records[i];
+                var tgt = r.target && r.target.nodeType === 1 ? r.target : (r.target && r.target.parentElement);
+                if (tgt && tgt.closest) queueBox(tgt.closest('.text-box'));
+                for (var j = 0; j < r.addedNodes.length; j++) {
+                    var n = r.addedNodes[j];
+                    if (n.nodeType !== 1) continue;
+                    if (n.matches && n.matches('.text-box')) queueBox(n);
+                    else if (n.querySelectorAll) {
+                        var inner = n.querySelectorAll('.text-box');
+                        for (var k = 0; k < inner.length; k++) queueBox(inner[k]);
+                    }
+                }
+            }
+        }).observe(document.body, { childList: true, subtree: true });
+    }
+    if (document.body) startObserver();
+    else document.addEventListener('DOMContentLoaded', startObserver);
+
     // Initial pass for fields already on the page with a prefilled "@..." value.
     function initialPass(){
         var f = document.querySelectorAll('input,textarea');
         for (var i = 0; i < f.length; i++) if (isTextField(f[i])) refreshField(f[i]);
-        var b = document.querySelectorAll('.text-box[contenteditable="true"]');
+        var b = document.querySelectorAll('.text-box');
         for (var j = 0; j < b.length; j++) refreshBoxAll(b[j]);
     }
     if (document.readyState === 'complete') setTimeout(initialPass, 0);
