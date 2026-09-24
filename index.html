@@ -36169,7 +36169,7 @@ function toMenu(){
 // on-ramp. It now starts near circle 1 and works up to circle 6 across the
 // seven skies, giving an actual ramp instead of dropping the player into
 // the deep end immediately.
-const lvl=()=>S.realm===R_HEAVEN?Math.min(6,1+Math.min(S.sky,6)*(5/6)):(S.realm===R_HELL?S.circle:(S.realm===R_DIM&&zoneKey()===1?4:9));
+const lvl=()=>S.realm===R_HEAVEN?Math.min(6,1+Math.min(S.sky,6)*(5/6)):(S.realm===R_HELL?S.circle:(S.realm===R_DIM&&(zoneKey()===1||zoneKey()===3)?4:9));
 // Reversed steering (mirror) and the upside-down screen (flip) are never offered
 // from the Pit (circle 9, "قعر") onward — real hell, the boss and heaven included.
 const lawOK=id=>{const r=LAWS[id].r||[0];if(r.indexOf(S.realm)<0)return false;if((id==='mirror'||id==='flip')&&(S.realm!==R_HELL||S.circle>=9))return false;return true;};
