@@ -8407,11 +8407,11 @@ window.mu_syncHtmlBg = function(){
             <span class="toolbar-section-title" id="secTitleInput">ورودی‌ها</span>
             <div class="toolbar-group">
                 <button class="btn-main" id="btnImportJson" onclick="document.getElementById('importFileInput').click()">ورودی JSON</button>
-                <input type="file" id="importFileInput" style="display:none" accept=".json,application/json" onchange="importBackup(event)">
+                <input type="file" id="importFileInput" style="display:none" onchange="importBackup(event)">
                 <button class="btn-main" id="btnImportCsv" onclick="document.getElementById('importCsvInput').click()">ورودی CSV</button>
-                <input type="file" id="importCsvInput" style="display:none" accept=".csv,text/csv" onchange="importCSV(event)">
+                <input type="file" id="importCsvInput" style="display:none" onchange="importCSV(event)">
                 <button class="btn-main" id="btnImportText" onclick="document.getElementById('importTextInput').click()">ورودی TXT / MD</button>
-                <input type="file" id="importTextInput" style="display:none" accept=".txt,.md,text/plain,text/markdown" onchange="importTextFile(event)">
+                <input type="file" id="importTextInput" style="display:none" onchange="importTextFile(event)">
             </div>
         </div>
 
@@ -13245,19 +13245,22 @@ window.mu_syncHtmlBg = function(){
 
         async function buildMixedEncryptedExportZip(items, chosenName, format) {
             const files = [];
-            const locked = items.filter(isNoteLocked);
+            const usedNames = new Set();
+            // Every locked note is included (opened or not) as its stored ciphertext.
+            const locked = getBackupCategories().filter(isNoteLocked);
             const plain = items.filter(i => !isNoteLocked(i));
             for (const item of locked) {
-                const blob = await createEncryptedExport(item);
-                files.push({name:`ENCRYPTED/${sanitizeFilename(item.name||'note')}.mne.json`,data:blob});
+                files.push({name:mu_uniqueZipName(usedNames,'ENCRYPTED',sanitizeFilename(item.name||'note'),'mne.json'),data:createStoredEncryptedExport(item)});
             }
             if (plain.length) {
+                // JSON/MD/HTML only carry media references unless resolved into real data.
+                const plainR = (format === 'json' || format === 'md' || format === 'html') ? await mu_resolveItemsMediaForExport(plain) : plain;
                 if (format === 'txt') {
                     const content = plain.map((item,index)=>`========================================\n${index+1}. ${item.name}${item.folder?` [Folder: ${item.folder}]`:''}\n========================================\n${getTxtContent(item.id,item).replace(/\n+$/,'')}\n`).join('\n');
                     files.push({name:'PLAIN/markhin_notes.txt',data:new Blob([content],{type:'text/plain;charset=utf-8'})});
-                } else if (format === 'json' || format === 'csv' || format === 'md') {
+                } else if (format === 'json' || format === 'csv' || format === 'md' || format === 'html') {
                     const ext=getStructuredExtension(format), mime=getStructuredMime(format);
-                    files.push({name:`PLAIN/markhin_${format==='json'?'backup':format==='csv'?'data':'notes'}.${ext}`,data:new Blob([buildStructuredExport(format,plain)],{type:mime})});
+                    files.push({name:`PLAIN/markhin_${format==='json'?'backup':format==='csv'?'data':'notes'}.${ext}`,data:new Blob([buildStructuredExport(format,plainR)],{type:mime})});
                 } else if (format === 'pdf') {
                     if (window.html2canvas&&window.jspdf?.jsPDF) files.push({name:'PLAIN/Markhin_Note_All_Notes.pdf',data:await createPDFBlob(plain)});
                 } else if (format === 'docx') {
@@ -13271,6 +13274,35 @@ window.mu_syncHtmlBg = function(){
             await robustDownload(zip,`${chosenName}.zip`,'application/zip');
         }
 
+        // Builds the same .mne.json envelope as createEncryptedExport(), but straight from the
+        // note's stored ciphertext: no password prompt and no unlock needed. The stored payload
+        // is kept current by saveCategory()/autosaveCategory(), and it is already encrypted.
+        function createStoredEncryptedExport(item) {
+            if (!item || !isNoteLocked(item)) throw new Error('Note is not encrypted.');
+            const persisted = getPersistedCategory(item);
+            const envelope = {
+                format: 'markhin-encrypted-note',
+                version: 1,
+                exportedAt: new Date().toISOString(),
+                note: {
+                    id: persisted.id, name: persisted.name, folder: persisted.folder || '',
+                    hint: persisted.hint || '', tags: persisted.tags || [],
+                    pinned: !!persisted.pinned, favorite: !!persisted.favorite,
+                    fontFamily: persisted.fontFamily || '', fontSize: persisted.fontSize || undefined,
+                    encrypted: { ...item.encrypted }
+                }
+            };
+            return new Blob([JSON.stringify(envelope, null, 2)], {type:'application/vnd.markhin.encrypted+json;charset=utf-8'});
+        }
+
+        // Two notes with the same title used to overwrite each other inside a ZIP (same path).
+        function mu_uniqueZipName(used, folder, base, ext) {
+            let name = `${folder}/${base}.${ext}`, n = 2;
+            while (used.has(name.toLowerCase())) name = `${folder}/${base} (${n++}).${ext}`;
+            used.add(name.toLowerCase());
+            return name;
+        }
+
         function getExportableCategories() {
             // A password-protected note must not be exportable just because it exists —
             // it needs to have actually been unlocked this session, either via the
@@ -13282,6 +13314,34 @@ window.mu_syncHtmlBg = function(){
             // a locked note's real content without ever asking for its password.
             return categories.filter(item => item && !item.isDecoy &&
                 (!isNoteLocked(item) || unlockedQaIds.includes(item.id) || activeOpenId === item.id));
+        }
+
+        // Full JSON backup: unlike the other formats, it can safely carry locked notes
+        // without unlocking them, because it only ever writes their existing ciphertext.
+        function getBackupCategories() {
+            return categories.filter(item => item && !item.isDecoy);
+        }
+
+        async function downloadFullJsonBackup() {
+            const all = getBackupCategories();
+            if (!all.length) return;
+            const chosenName = await promptFilename('markhin_backup', 'json', {
+                desc: currentLang==='fa'
+                    ? 'نام فایل JSON شامل همه یادداشت‌ها (یادداشت‌های قفل‌شده به‌صورت رمزنگاری‌شده داخلش می‌مانند).'
+                    : 'Name for the JSON file with all notes (locked notes stay encrypted inside it).'
+            });
+            if (chosenName === null) { closeAdvancedModal(); return; }
+            try {
+                const unlockedItems = all.filter(i => !isNoteLocked(i));
+                const resolved = unlockedItems.length ? await mu_resolveItemsMediaForExport(unlockedItems) : [];
+                const byId = new Map(resolved.map(r => [String(r.id), r]));
+                const ordered = all.map(i => isNoteLocked(i) ? i : (byId.get(String(i.id)) || i));
+                const blob = new Blob([buildStructuredExport('json', ordered, {allFolders:true})], {type:getStructuredMime('json')});
+                await robustDownload(blob, `${chosenName}.json`, getStructuredMime('json'));
+            } catch (e) {
+                console.error('JSON backup error:', e);
+                alert(currentLang==='fa'?'دانلود خروجی انجام نشد.':'Export download failed.');
+            } finally { closeAdvancedModal(); }
         }
 
         function buildExportText(item) {
@@ -14928,9 +14988,91 @@ window.mu_syncHtmlBg = function(){
         }
 
 
+        // Restores a ZIP produced by the ZIP exports: every ENCRYPTED/*.mne.json note and any JSON
+        // backup inside it. Additive only: notes whose id already exists are skipped, never overwritten.
+        async function importBackupZip(file, input) {
+            const fa = currentLang === 'fa';
+            try {
+                const JSZipCtor = await ensureZipEngine();
+                const zip = await JSZipCtor.loadAsync(file);
+                const entries = Object.keys(zip.files).filter(n => !zip.files[n].dir && /\.json$/i.test(n));
+                if (!entries.length) throw new Error('No JSON files in ZIP');
+                const existing = new Set(categories.map(c => String(c.id)));
+                let added = 0, skipped = 0, lockedAdded = 0, idx = 0;
+                const addNote = raw => {
+                    const rawId = raw && raw.id != null ? String(raw.id) : '';
+                    if (rawId && existing.has(rawId)) { skipped++; return; }
+                    const note = normalizeCategory(raw, categories.length + idx++);
+                    if (existing.has(String(note.id))) { skipped++; return; }
+                    if (isNoteLocked(note)) { note.html = ''; note.text = ''; note.isDecoy = false; lockedAdded++; }
+                    else note.html = sanitizeHtml(note.html || note.text || '');
+                    categories.push(note);
+                    existing.add(String(note.id));
+                    added++;
+                    if (note.folder && note.folder !== DEFAULT_FOLDER && !folders.includes(note.folder)) folders.push(note.folder);
+                };
+                for (const name of entries) {
+                    let data;
+                    try { data = JSON.parse(await zip.files[name].async('string')); } catch (_) { skipped++; continue; }
+                    if (data && data.format === 'markhin-encrypted-note' && data.note && data.note.encrypted) {
+                        const n = data.note, enc = n.encrypted;
+                        if (!enc.ciphertext || !enc.salt || !enc.iv) { skipped++; continue; }
+                        addNote({
+                            id: n.id, name: n.name || 'Imported Note', folder: n.folder || '',
+                            text: '', html: '', encrypted: enc, hint: n.hint || '',
+                            tags: n.tags || [], pinned: !!n.pinned, favorite: !!n.favorite,
+                            fontFamily: n.fontFamily || '', fontSize: n.fontSize,
+                            lastEdited: data.exportedAt || new Date().toUTCString()
+                        });
+                    } else if (data && Array.isArray(data.categories)) {
+                        data.categories.filter(x => x && typeof x === 'object').forEach(addNote);
+                        (Array.isArray(data.folders) ? data.folders : []).forEach(f => {
+                            if (typeof f === 'string' && f.trim() && f !== 'همه' && f !== 'All' && f !== DEFAULT_FOLDER && !folders.includes(f.trim())) folders.push(f.trim());
+                        });
+                        // Same bug fix as importBackup(): older backups kept Time Capsule/Ghost
+                        // Note/Decay fields in a separate advancedMeta blob rather than on the
+                        // note itself. Without this, a legacy backup restored via ZIP silently
+                        // lost those fields even though restoring the same file directly (not
+                        // inside a ZIP) applied them correctly.
+                        if (data.advancedMeta && typeof data.advancedMeta === 'object') {
+                            data.categories.forEach(raw => {
+                                if (!raw || typeof raw !== 'object' || raw.id == null) return;
+                                const item = categories.find(c => String(c.id) === String(raw.id));
+                                const m = data.advancedMeta[raw.id];
+                                if (!item || !m || typeof m !== 'object') return;
+                                if (!item.unlockAt && m.unlockAt) item.unlockAt = m.unlockAt;
+                                if (!item.ghostUntil && m.ghostUntil) item.ghostUntil = m.ghostUntil;
+                                if (!item.decayLevel && m.decayLevel) item.decayLevel = m.decayLevel;
+                                if (m.manualDecay) item.decayManual = true;
+                            });
+                        }
+                    } else { skipped++; }
+                }
+                if (!added) {
+                    alert(fa ? (skipped ? 'همه‌ی یادداشت‌های این ZIP از قبل در برنامه هستند.' : 'یادداشتی در این ZIP پیدا نشد.')
+                             : (skipped ? 'All notes in this ZIP already exist.' : 'No notes found in this ZIP.'));
+                    return;
+                }
+                saveToLocalStorage();
+                saveFoldersToLocalStorage();
+                await mu_flushStorage();
+                activeOpenId = null;
+                renderApp();
+                showToast(fa
+                    ? `${added} یادداشت از ZIP وارد شد (${lockedAdded} قفل‌شده)${skipped ? `؛ ${skipped} مورد تکراری/نامعتبر رد شد` : ''}.`
+                    : `${added} notes imported from ZIP (${lockedAdded} locked)${skipped ? `; ${skipped} duplicate/invalid skipped` : ''}.`, 4200);
+            } catch (err) {
+                console.error(err);
+                alert(fa ? 'خواندن فایل ZIP انجام نشد.' : 'Could not read the ZIP file.');
+            } finally {
+                input.value = '';
+            }
+        }
+
         function importBackup(event) {
             const file = event.target.files?.[0];
             if (!file) return;
+            if (/\.zip$/i.test(file.name || '')) { importBackupZip(file, event.target); return; }
             const reader = new FileReader();
             // Bug fix (save barrier): made async so the two saveToLocalStorage() calls
             // below can be followed by `await mu_flushStorage()` — Import replaces the
@@ -14945,7 +15087,7 @@ window.mu_syncHtmlBg = function(){
                         const note = data.note;
                         if (!note.encrypted.ciphertext || !note.encrypted.salt || !note.encrypted.iv) throw new Error('Invalid encrypted note');
                         const imported = normalizeCategory({
-                            id: note.id || `${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
+                            id: (note.id && !categories.some(c => String(c.id) === String(note.id))) ? note.id : `${Date.now()}_${Math.random().toString(36).slice(2,8)}`,
                             name: note.name || 'Imported Note', folder: note.folder || '',
                             text: '', html: '', encrypted: note.encrypted, hint: note.hint || '',
                             tags: note.tags || [], pinned: !!note.pinned, favorite: !!note.favorite,
@@ -14965,17 +15107,26 @@ window.mu_syncHtmlBg = function(){
                     // Unlike CSV/TXT import (which add notes alongside existing ones), restoring
                     // a JSON backup replaces the entire dataset — make sure that's really what
                     // the person wants before any existing note/folder is overwritten.
+                    const backupIds = new Set(data.categories.filter(x => x && typeof x === 'object').map(x => String(x.id)));
+                    const keepLocked = categories.filter(c => c && isNoteLocked(c) && !c.isDecoy && !backupIds.has(String(c.id)));
                     const confirmMsg = currentLang === 'fa'
                         ? `این کار همه یادداشت‌ها و پوشه‌های فعلی (${categories.length} یادداشت) را با محتوای این فایل بکاپ جایگزین می‌کند و قابل بازگشت نیست. ادامه می‌دهید؟`
                         : `This will replace ALL current notes and folders (${categories.length} notes) with the contents of this backup file and cannot be undone. Continue?`;
-                    if (!confirm(confirmMsg)) return;
+                    const keepMsg = keepLocked.length
+                        ? (currentLang === 'fa'
+                            ? `\n\n${keepLocked.length} یادداشت قفل‌شده که در این فایل نیستند حفظ می‌شوند.`
+                            : `\n\n${keepLocked.length} locked note(s) that are not in this file will be kept.`)
+                        : '';
+                    if (!confirm(confirmMsg + keepMsg)) return;
                         categories = data.categories.filter(x => x && typeof x === 'object').map((item, index) => normalizeCategory(item, index));
                     categories.forEach(item => {
                         if (isNoteLocked(item)) { item.html = ''; item.text = ''; item.isDecoy = false; }
                         else item.html = sanitizeHtml(item.html || item.text || '');
                     });
+                    keepLocked.forEach(n => { if (!categories.some(c => String(c.id) === String(n.id))) categories.push(n); });
                     const importedFolders = Array.isArray(data.folders) ? data.folders.filter(f => typeof f === 'string' && f.trim()) : [];
                     folders = [DEFAULT_FOLDER, ...[...new Set(importedFolders.filter(f => f !== 'همه' && f !== 'All' && f !== DEFAULT_FOLDER).map(f => f.trim()))]];
+                    keepLocked.forEach(n => { if (n.folder && !folders.includes(n.folder)) folders.push(n.folder); });
                     categories.forEach(item => { if (item.folder && !folders.includes(item.folder)) item.folder = ''; });
                     currentFolder = folders.includes(currentFolder) ? currentFolder : DEFAULT_FOLDER;
                     // Older backups (from before Time Capsule/Ghost Note/Decay moved onto the
@@ -15018,7 +15169,8 @@ window.mu_syncHtmlBg = function(){
 
         function openStructuredExportPicker(type) {
             const items = getExportableCategories();
-            if (!items.length) {
+            const totalCount = getBackupCategories().length;
+            if (!totalCount) {
                 alert(currentLang === 'fa' ? 'یادداشتی برای خروجی وجود ندارد.' : 'There are no notes to export.');
                 return;
             }
@@ -15051,14 +15203,14 @@ window.mu_syncHtmlBg = function(){
                 </button>`;
             }).join('');
             showAdvanced(`<div class="advanced-head image-export-picker-head"><h3>📤 ${title}</h3><button class="btn-main" onclick="closeAdvancedModal()">✕</button></div>
-                <div class="image-export-picker-actions"><span class="image-export-count">${items.length} ${fa ? 'یادداشت' : 'notes'}</span></div>
+                <div class="image-export-picker-actions"><span class="image-export-count">${totalCount} ${fa ? 'یادداشت' : 'notes'}</span></div>
                 <div class="image-export-choice-grid">
                     <button type="button" class="image-export-choice" onclick="downloadStructuredAll('${type}')"><span class="image-export-choice-icon">📚</span><span class="image-export-choice-name">${fa ? 'همه یادداشت‌ها' : 'All notes'}</span><span class="image-export-choice-folder">${escapeHtml(allDescMap[type] || '')}</span><span class="image-export-choice-action">${fa ? `خروجی ${ext} همه` : `Export all as ${ext}`}</span></button>
                     ${cards}
                 </div>`);
         }
 
-        function buildStructuredExport(type, items) {
+        function buildStructuredExport(type, items, opts) {
             const safeItems = Array.isArray(items) ? items : [];
             if (type === 'json') {
                 const folderSet = [...new Set(safeItems.map(i => i.folder).filter(Boolean))];
@@ -15069,8 +15221,15 @@ window.mu_syncHtmlBg = function(){
                 // when the note is open, otherwise from the saved HTML. item.text is
                 // only kept in sync while a note is open, so using it as-is here could
                 // export stale text with different (or missing) blank lines/spacing.
-                const jsonItems = safeItems.map(i => ({ ...i, text: getTxtContent(i.id, i) }));
-                return JSON.stringify({ categories: jsonItems, folders: [DEFAULT_FOLDER, ...folderSet.filter(f => f !== DEFAULT_FOLDER)] }, null, 2);
+                // Locked notes go out exactly as stored: encrypted payload + hint, with
+                // no plaintext and no password (getPersistedCategory strips both).
+                const jsonItems = safeItems.map(i => {
+                    if (isNoteLocked(i)) return getPersistedCategory(i);
+                    const c = { ...i, text: getTxtContent(i.id, i) };
+                    delete c.password;
+                    return c;
+                });
+                return JSON.stringify({ categories: jsonItems, folders: (opts && opts.allFolders) ? [...new Set([DEFAULT_FOLDER, ...folders, ...folderSet])] : [DEFAULT_FOLDER, ...folderSet.filter(f => f !== DEFAULT_FOLDER)] }, null, 2);
             }
             if (type === 'md') {
                 const out = safeItems.map((item, index) => {
@@ -15136,8 +15295,11 @@ ${body}
         function getStructuredMime(type) { return {json:'application/json;charset=utf-8',csv:'text/csv;charset=utf-8',md:'text/markdown;charset=utf-8',txt:'text/plain;charset=utf-8',html:'text/html;charset=utf-8'}[type] || 'application/octet-stream'; }
 
         async function downloadStructuredAll(type) {
-            const items = getExportableCategories(); if (!items.length) return;
-            if (items.some(isNoteLocked)) {
+            if (type === 'json') return downloadFullJsonBackup();
+            const items = getExportableCategories();
+            const hasLocked = getBackupCategories().some(isNoteLocked);
+            if (!items.length && !hasLocked) return;
+            if (hasLocked) {
                 const chosenName=await promptFilename(`markhin_${type}_secure`,'zip',{desc:currentLang==='fa'?'یادداشت‌های قفل‌شده داخل فایل‌های رمزنگاری‌شده قرار می‌گیرند.':'Locked notes will be included as encrypted Markhin exports.'});
                 if(chosenName===null){closeAdvancedModal();return;}
                 try{await buildMixedEncryptedExportZip(items,chosenName,type);closeAdvancedModal();showToast(currentLang==='fa'?'ZIP امن آماده شد.':'Secure ZIP export is ready.');}catch(e){console.error(e);alert(currentLang==='fa'?'خروجی انجام نشد.':'Export failed.');}
@@ -15174,7 +15336,8 @@ ${body}
             finally { closeAdvancedModal(); }
         }
 
-        function parseCSV(text) {
+        function parseCSV(text, delimiter) {
+            const DELIM = delimiter || ',';
             const rows = [];
             let row = [], field = '', quoted = false;
             const input = String(text ?? '').replace(/^\ufeff/, '');
@@ -15183,7 +15346,7 @@ ${body}
                 if (ch === '"') {
                     if (quoted && input[i + 1] === '"') { field += '"'; i++; }
                     else quoted = !quoted;
-                } else if (ch === ',' && !quoted) {
+                } else if (ch === DELIM && !quoted) {
                     row.push(field); field = '';
                 } else if ((ch === '\n' || ch === '\r') && !quoted) {
                     if (ch === '\r' && input[i + 1] === '\n') i++;
@@ -15202,10 +15365,22 @@ ${body}
         function importCSV(event) {
             const file = event.target.files?.[0];
             if (!file) return;
+            if (!/\.(csv|tsv|txt)$/i.test(file.name || '')) {
+                alert(currentLang === 'fa' ? 'لطفاً یک فایل CSV انتخاب کن.' : 'Please choose a CSV file.');
+                event.target.value = '';
+                return;
+            }
             const reader = new FileReader();
             reader.onload = function(e) {
                 try {
-                    const rows = parseCSV(String(e.target.result || ''));
+                    const csvText = String(e.target.result || '').replace(/^\ufeff/, '');
+                    // Excel in some locales saves CSV with ; or tab instead of comma.
+                    const firstLine = csvText.split(/\r?\n/, 1)[0] || '';
+                    const count = ch => (firstLine.match(new RegExp(ch === '\t' ? '\t' : '\\' + ch, 'g')) || []).length;
+                    let delim = ',';
+                    if (count(';') > count(delim)) delim = ';';
+                    if (count('\t') > count(delim)) delim = '\t';
+                    const rows = parseCSV(csvText, delim);
                     if (rows.length < 2) throw new Error('empty');
                     let added = 0;
                     rows.slice(1).forEach((cols, index) => {
@@ -15223,7 +15398,7 @@ ${body}
                         categories.push(normalizeCategory({
                             id: `${Date.now()}_${index}_${Math.random().toString(36).slice(2,8)}`,
                             name, folder: folder === 'undefined' ? '' : folder,
-                            text: cols[3], html: sanitizeHtml(cols[3]), history: [],
+                            text: cols[3], html: sanitizeHtml(escapeHtml(cols[3]).replace(/\r\n?|\n/g, '<br>')), history: [],
                             lastEdited: new Date().toUTCString(),
                             tags, pinned, favorite, fontFamily, fontSize
                         }, index));
@@ -15261,16 +15436,18 @@ ${body}
 
 
         async function buildExportBundle(selected = {}, chosenZipName = null) {
-            const items=getExportableCategories(); if(!items.length)return;
+            const items=getExportableCategories();
+            if(!items.length && !getBackupCategories().some(isNoteLocked))return;
             const btn=document.getElementById('btnExportBundle'), old=btn?.innerHTML;
             try {
                 if(btn){btn.disabled=true;btn.innerHTML='⏳ ساخت بسته...';}
                 const files=[];
                 let skipped=0;
-                const lockedItems=items.filter(isNoteLocked);
+                const lockedItems=getBackupCategories().filter(isNoteLocked);
                 const plainItems=items.filter(i=>!isNoteLocked(i));
+                const usedNames=new Set();
                 for (const locked of lockedItems) {
-                    try { const blob=await createEncryptedExport(locked); files.push({name:`ENCRYPTED/${sanitizeFilename(locked.name||'note')}.mne.json`,data:blob}); }
+                    try { files.push({name:mu_uniqueZipName(usedNames,'ENCRYPTED',sanitizeFilename(locked.name||'note'),'mne.json'),data:createStoredEncryptedExport(locked)}); }
                     catch(e){ skipped++; console.warn('Encrypted export skipped:',locked.name,e); }
                 }
                 // Every export is isolated: if one format fails, the remaining formats continue.
@@ -15298,7 +15475,7 @@ ${body}
                 // and share the result between JSON and MD so media isn't decoded twice.
                 let mediaResolvedItems = null;
                 const getMediaResolvedItems = async () => { if (!mediaResolvedItems) mediaResolvedItems = await mu_resolveItemsMediaForExport(plainItems); return mediaResolvedItems; };
-                if(selected.json && plainItems.length) await addExport('markhin_backup.json', async () => { const ri = await getMediaResolvedItems(); return JSON.stringify({categories:ri.map(i=>({...i,text:getTxtContent(i.id,i)})),folders},null,2); });
+                if(selected.json && (plainItems.length || lockedItems.length)) await addExport('markhin_backup.json', async () => { const ri = plainItems.length ? await getMediaResolvedItems() : []; return JSON.stringify({categories:[...ri.map(i=>{const c={...i,text:getTxtContent(i.id,i)}; delete c.password; return c;}), ...lockedItems.map(getPersistedCategory)],folders},null,2); });
                 if(selected.csv && plainItems.length) await addExport('markhin_data.csv', async () => '\ufeff'+[['ID','Name','Folder','Text','Tags','Pinned','Favorite','FontFamily','FontSize'],...plainItems.map(i=>[i.id,i.name,i.folder||'',getTxtContent(i.id,i)||'',(i.tags||[]).join('; '),i.pinned?'1':'0',i.favorite?'1':'0',i.fontFamily||'',i.fontSize||''])].map(r=>r.map(csvEscape).join(',')).join('\r\n'));
                 if(selected.md && plainItems.length) await addExport('markhin_notes.md', async () => { const ri = await getMediaResolvedItems(); return '# Markhin Note\n\n'+ri.map((item,index)=>`# ${index+1}. ${markdownEscape(item.name)}\n\n${htmlToMarkdown(item.html,item.text)}`).join('\n\n---\n\n'); });
                 if(selected.txt && plainItems.length) await addExport('markhin_notes.txt', async () => plainItems.map((item,index)=>`========================================\n${index+1}. ${item.name}${item.folder?` [Folder: ${item.folder}]`:''}\n========================================\n${getTxtContent(item.id,item).replace(/\n+$/,'')}\n`).join('\n'));
@@ -15343,7 +15520,7 @@ ${body}
         }
 
         function exportBundle(){
-            const items=getExportableCategories(); if(!items.length){alert(currentLang==='fa'?'یادداشتی برای خروجی وجود ندارد.':'There are no notes to export.');return;}
+            const items=getExportableCategories(); if(!items.length && !getBackupCategories().some(isNoteLocked)){alert(currentLang==='fa'?'یادداشتی برای خروجی وجود ندارد.':'There are no notes to export.');return;}
             const fa=currentLang==='fa';
             const opts=[['json',fa?'پشتیبان JSON':'JSON Backup',fa?'اطلاعات کامل برنامه':'Full app data'],['csv','CSV',fa?'داده‌های جدولی':'Tabular data'],['md','Markdown',fa?'یادداشت‌ها با قالب Markdown':'Notes in Markdown'],['txt',fa?'متن ساده':'Plain Text',fa?'نسخه متنی':'Plain-text notes'],['docx','DOCX',fa?'فایل Word':'Word document'],['readme','README',fa?'راهنمای بسته':'Bundle guide']];
             showAdvanced(`<div class="advanced-head"><h3>📦 ${fa?'انتخاب خروجی‌های ZIP':'Choose ZIP contents'}</h3><button class="btn-main" onclick="closeAdvancedModal()">✕</button></div><p style="opacity:.62;font-size:11px;line-height:1.7">${fa?'خروجی‌هایی را که می‌خواهی داخل ZIP باشند انتخاب کن. اگر یکی خطا بدهد، فقط همان خروجی رد می‌شود و بقیه ادامه پیدا می‌کنند.':'Choose the exports to include. If one fails, only that export is skipped and the rest continue.'}</p><div class="zip-export-picker-actions"><span class="image-export-count">${items.length} ${fa?'یادداشت':'notes'}</span><span><button class="btn-main image-export-all-btn" onclick="toggleZipExportChecks(true)">${fa?'انتخاب همه':'Select all'}</button> <button class="btn-main image-export-all-btn" onclick="toggleZipExportChecks(false)">${fa?'لغو همه':'Clear all'}</button></span></div><div class="zip-export-picker-grid" id="zipExportPickerGrid">${opts.map(([key,name,desc])=>`<label class="zip-export-option"><input type="checkbox" data-zip-key="${key}" checked><span class="zip-export-option-text"><span class="zip-export-option-name">${name}</span><span class="zip-export-option-desc">${desc}</span></span></label>`).join('')}</div><div class="zip-export-picker-actions"><button class="btn-main" onclick="closeAdvancedModal()">${fa?'انصراف':'Cancel'}</button><button class="btn-main" onclick="startSelectedZipExport()">📦 ${fa?'ساخت بسته ZIP':'Build ZIP'}</button></div>`);
@@ -15351,22 +15528,61 @@ ${body}
         function toggleZipExportChecks(value){document.querySelectorAll('#zipExportPickerGrid input[data-zip-key]').forEach(cb=>cb.checked=!!value);}
         async function startSelectedZipExport(){const selected={};document.querySelectorAll('#zipExportPickerGrid input[data-zip-key]').forEach(cb=>selected[cb.dataset.zipKey]=cb.checked);if(!Object.values(selected).some(Boolean)){alert(currentLang==='fa'?'حداقل یک خروجی را انتخاب کن.':'Select at least one export.');return;}const chosenZipName=await promptFilename('Markhin_Note_Bundle','zip',{desc:currentLang==='fa'?'نام فایل ZIP بسته کامل خروجی.':'Name for the complete export ZIP bundle.'});if(chosenZipName===null){closeAdvancedModal();return;}closeAdvancedModal();await buildExportBundle(selected,chosenZipName);}
 
+        // Detects the "All notes" TXT export format produced by buildStructuredExport()
+        // (repeated "==== \n N. Name [Folder: X] \n ====" header blocks) and splits it
+        // back into separate {name, folder, content} entries. Returns null if the file
+        // doesn't start with that header pattern, so a plain single-note TXT file still
+        // imports as one note exactly as before.
+        function parseMultiNoteTxt(raw) {
+            const headerRe = /^={10,}[ \t]*\r?\n(\d+)\.[ \t]?(.*?)\r?\n={10,}[ \t]*\r?\n/gm;
+            const matches = [];
+            let m;
+            while ((m = headerRe.exec(raw))) matches.push({ start: m.index, end: headerRe.lastIndex, header: m[2] });
+            if (!matches.length || matches[0].start !== 0) return null;
+            return matches.map((mm, i) => {
+                const contentEnd = i + 1 < matches.length ? matches[i + 1].start : raw.length;
+                const content = raw.slice(mm.end, contentEnd).replace(/\n+$/, '');
+                let name = mm.header, folder = '';
+                const fm = name.match(/^(.*?)\s*\[Folder:\s*(.*?)\]\s*$/);
+                if (fm) { name = fm[1]; folder = fm[2]; }
+                return { name: name.trim() || 'Imported Note', folder: folder.trim(), content };
+            });
+        }
+
         function importTextFile(event) {
             const file = event.target.files?.[0];
             if (!file) return;
+            if (!/\.(txt|md|markdown)$/i.test(file.name || '')) {
+                alert(currentLang === 'fa' ? 'لطفاً یک فایل TXT یا MD انتخاب کن.' : 'Please choose a TXT or MD file.');
+                event.target.value = '';
+                return;
+            }
             const reader = new FileReader();
             reader.onload = function(e) {
                 try {
                     const raw = String(e.target.result || '').replace(/^\ufeff/, '');
-                    const isMd = /\.md$/i.test(file.name);
-                    let name = file.name.replace(/\.(txt|md)$/i, '').trim() || 'Imported Note';
+                    const isMd = /\.(md|markdown)$/i.test(file.name);
+                    const multiNotes = !isMd ? parseMultiNoteTxt(raw) : null;
+                    if (multiNotes) {
+                        multiNotes.forEach((note, idx) => {
+                            const html = escapeHtml(note.content).replace(/\r\n?/g,'\n').replace(/\n/g,'<br>');
+                            const folder = note.folder && note.folder !== 'undefined' ? note.folder : (currentFolder !== DEFAULT_FOLDER ? currentFolder : '');
+                            categories.push(normalizeCategory({id:`${Date.now()}_${idx}_${Math.random().toString(36).slice(2,8)}`,name:note.name,folder,text:note.content,html:sanitizeHtml(html),history:[],lastEdited:new Date().toUTCString(),password:'',hint:'',isDecoy:false}, categories.length));
+                            if (folder && folder !== DEFAULT_FOLDER && !folders.includes(folder)) folders.push(folder);
+                        });
+                        saveToLocalStorage(); saveFoldersToLocalStorage();
+                        renderApp();
+                        showToast(currentLang === 'fa' ? `${multiNotes.length} یادداشت وارد شد.` : `${multiNotes.length} notes imported.`);
+                        return;
+                    }
+                    let name = file.name.replace(/\.(txt|md|markdown)$/i, '').trim() || 'Imported Note';
                     let html = '';
                     if (isMd) {
                         html = markdownToSafeHtml(raw);
                     } else {
                         html = escapeHtml(raw).replace(/\r\n?/g,'\n').replace(/\n/g,'<br>');
                     }
-                    categories.push({id:`${Date.now()}_${Math.random().toString(36).slice(2,8)}`,name,folder:currentFolder !== DEFAULT_FOLDER ? currentFolder : '',text:raw,html:sanitizeHtml(html),history:[],lastEdited:new Date().toUTCString(),password:'',hint:'',isDecoy:false});
+                    categories.push(normalizeCategory({id:`${Date.now()}_${Math.random().toString(36).slice(2,8)}`,name,folder:currentFolder !== DEFAULT_FOLDER ? currentFolder : '',text:raw,html:sanitizeHtml(html),history:[],lastEdited:new Date().toUTCString(),password:'',hint:'',isDecoy:false}, categories.length));
                     saveToLocalStorage();
                     renderApp();
                     showToast(currentLang === 'fa' ? 'فایل متنی وارد شد.' : 'Text file imported.');
@@ -15490,6 +15706,12 @@ ${body}
                 // a reopened snapshot render in quirks mode; add it back explicitly.
                 let fullHtml = '<!DOCTYPE html>\n' + docClone.outerHTML;
 
+                // Embeds arbitrary text as a valid JS string literal inside an inline <script>.
+                // (The old jsEscape() only escaped < > & ' — quotes, backslashes and newlines in
+                // note content broke the seed, so notes came back empty from a snapshot.)
+                const jsLiteral = s => JSON.stringify(String(s))
+                    .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
+                    .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
                 const jsEscape = s => s.replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026').replace(/'/g, "\\u0027");
                 let seedLines = '';
                 if (mode !== 'clean') {
@@ -15501,19 +15723,19 @@ ${body}
                     // resolved back into embedded base64 here or the note would
                     // open with broken images/audio.
                     const resolvedForSnapshot = await mu_resolveItemsMediaForExport(serializeCategoriesForStorage());
-                    const categoriesJson = jsEscape(JSON.stringify(resolvedForSnapshot));
-                    const foldersJson = jsEscape(JSON.stringify(folders.filter(f => f !== DEFAULT_FOLDER)));
+                    const categoriesJson = jsLiteral(JSON.stringify(resolvedForSnapshot));
+                    const foldersJson = jsLiteral(JSON.stringify(folders.filter(f => f !== DEFAULT_FOLDER)));
                     seedLines += `
-                            localStorage.setItem('app_categories_v13', '${categoriesJson}');
-                            localStorage.setItem('app_folders_v13', '${foldersJson}');`;
+                            localStorage.setItem('app_categories_v13', ${categoriesJson});
+                            localStorage.setItem('app_folders_v13', ${foldersJson});`;
                 }
                 if (mode === 'everything') {
                     // Only this mode carries the AI provider settings (including the API key)
                     // into the exported file, and only via this explicit, deliberate seed —
                     // never as a byproduct of cloning whatever happened to be on screen.
-                    const aiSettingsJson = jsEscape(JSON.stringify(MarkhinAI.getSettings()));
+                    const aiSettingsJson = jsLiteral(JSON.stringify(MarkhinAI.getSettings()));
                     seedLines += `
-                            localStorage.setItem('${MarkhinAI.KEY}', '${aiSettingsJson}');`;
+                            localStorage.setItem('${MarkhinAI.KEY}', ${aiSettingsJson});`;
                 }
                 let dataScript = seedLines ? `
                     <script data-markhin-seed="1">
@@ -15521,7 +15743,11 @@ ${body}
                         });
                     <\/script>
                 ` : '';
-                fullHtml = fullHtml.replace('</body>', dataScript + '</body>');
+                // Insert before the LAST </body>: an earlier "</body>" exists inside this page's own
+                // scripts (the HTML-export template), and a string replacement would also have
+                // mangled "$&" / "$$" sequences in note content.
+                const bodyEnd = fullHtml.lastIndexOf('</body>');
+                fullHtml = bodyEnd >= 0 ? fullHtml.slice(0, bodyEnd) + dataScript + fullHtml.slice(bodyEnd) : fullHtml + dataScript;
 
                 const blob = new Blob([fullHtml], { type: 'text/html;charset=utf-8' });
                 // Was a raw anchor+blob click with no fallback — inside Telegram's in-app
