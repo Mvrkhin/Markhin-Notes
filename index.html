@@ -5971,6 +5971,14 @@
             border-top: 1px dashed rgba(255,255,255,0.25);
         }
 
+        /* Added when the media next to a frame line is deleted: only the dashed
+           rule disappears (color goes transparent, so the 1px thickness and all
+           margin/padding/min-height stay exactly the same). It's a class rather
+           than an inline style because sanitizeHtml() strips inline styles when
+           the note is reloaded, which used to bring the dashed lines back. */
+        .img-below-line.mu-dash-off, .img-top-divider.mu-dash-off { border-top-color: transparent; }
+        .img-above-line.mu-dash-off { border-bottom-color: transparent; }
+
         .img-toolbar {
             position: absolute;
             top: 8px;
@@ -12044,6 +12052,12 @@ window.mu_syncHtmlBg = function(){
             // captured value) so it always picks up the hydrated image once ready.
             mu_hydrateMedia(textBox);
 
+            // Frame lines whose image/drawing/voice was already deleted (their dashed
+            // rule came back after an earlier reload) lose just the dashed rule too.
+            const isMedia = n => !!n && n.classList && (n.classList.contains('img-drag-wrapper') || n.classList.contains('audio-wrapper'));
+            textBox.querySelectorAll('.img-below-line').forEach(el => { if (!isMedia(el.previousElementSibling)) mu_stripFrameLineDash(el); });
+            textBox.querySelectorAll('.img-above-line, .img-top-divider').forEach(el => { if (!isMedia(el.nextElementSibling)) mu_stripFrameLineDash(el); });
+
             textBox.querySelectorAll('.img-drag-wrapper').forEach(wrapper => {
                 const img = wrapper.querySelector('img');
                 if (!img) return;
@@ -12410,8 +12424,7 @@ window.mu_syncHtmlBg = function(){
         // line, never the blank spacer line above/below it.
         function mu_stripFrameLineDash(el) {
             if (!el) return;
-            if (el.classList.contains('img-below-line') || el.classList.contains('img-top-divider')) el.style.borderTop = 'none';
-            else if (el.classList.contains('img-above-line')) el.style.borderBottom = 'none';
+            el.classList.add('mu-dash-off');
         }
 
         // Deletes an image/drawing/audio wrapper and strips the dashed line
@@ -30975,7 +30988,7 @@ STR.fa.item = {
     lantern: '🏮 فانوس حقیقت! دکمه‌ی 🏮 رو بزن تا رازها پیدا شن',
     hourglass: '⏳ ساعت شنی! دکمه‌ی ⏳ زمان رو می‌ایسته',
     key: '🗝️ کلید ارواح! حالا زود فرار کن!',
-    shieldBreak: '🛡️ سپر شکست — ولی زنده موندی!',
+    shieldBreak: '??️ سپر شکست — ولی زنده موندی!',
     curse: '🌀 نفرین! جهت‌ها معکوس شدن',
     locked: '🔒 مهر بسته‌ست — کلید ارواح رو بیار',
     unlocked: '🗝️ مهر شکست!',
@@ -44719,5 +44732,130 @@ function mAi_removeAttachment(id) { return MU_AI.removeAttachment(id); }
 function mAi_openAttImageFor(mid, idx) { return MU_AI.openAttImageFor(mid, idx); }
 </script>
 
+<style id="muAtLtrFix">
+/* Text that starts with "@" (usernames, emails, handles) must read
+   left-to-right: "@" stays at the LEFT and typing continues to the right.
+   The app is RTL, so a field/line made only of neutral characters
+   ("@", "@123", "@user_1") used to fall back to RTL and put "@" on the
+   right. JS below marks such fields/lines with data-mu-at. */
+input[data-mu-at], textarea[data-mu-at] {
+    direction: ltr !important;
+    text-align: left !important;
+}
+.text-box:not(.masked)[data-mu-at],
+.text-box:not(.masked) [data-mu-at] {
+    direction: ltr !important;
+    text-align: left !important;
+}
+</style>
+<script id="muAtLtrFixJs">
+(function(){
+    'use strict';
+    var AT = 'data-mu-at';
+    var STRONG_RTL = /[\u0590-\u05FF\u0621-\u064A\u0671-\u06D3\u06FA-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/;
+    var STRONG_LTR = /[A-Za-z\u00C0-\u024F]/;
+    var LEAD = /^[\s\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]+/;
+    var TEXT_TYPES = { '': 1, text: 1, search: 1, url: 1, email: 1, tel: 1 };
+    var BLOCK_SEL = 'div,p,li,blockquote,pre,h1,h2,h3,h4,h5,h6';
+    var BLOCK_RE = /^(DIV|P|LI|UL|OL|BLOCKQUOTE|PRE|H[1-6]|TABLE|TR|TD|TH)$/;
+
+    // true if the text starts with "@" and the first real letter after it
+    // is not Persian/Arabic/Hebrew (so "@user", "@123", "@" => LTR,
+    // while "@سلام" keeps normal RTL behavior).
+    function wantsLtr(text){
+        var t = String(text == null ? '' : text).replace(LEAD, '');
+        if (t.charAt(0) !== '@') return false;
+        for (var i = 1; i < t.length; i++) {
+            var c = t.charAt(i);
+            if (STRONG_RTL.test(c)) return false;
+            if (STRONG_LTR.test(c)) return true;
+        }
+        return true;
+    }
+    function setMark(el, on){
+        if (on) { if (el.getAttribute(AT) !== '1') el.setAttribute(AT, '1'); }
+        else if (el.hasAttribute(AT)) el.removeAttribute(AT);
+    }
+    function isTextField(el){
+        if (!el || el.nodeType !== 1) return false;
+        if (el.nodeName === 'TEXTAREA') return true;
+        if (el.nodeName !== 'INPUT') return false;
+        return Object.prototype.hasOwnProperty.call(TEXT_TYPES, (el.getAttribute('type') || '').toLowerCase());
+    }
+    function refreshField(el){ setMark(el, wantsLtr(el.value)); }
+
+    // First visual line of an element: its own text up to the first <br> or block child.
+    function ownLineText(el){
+        var s = '';
+        for (var n = el.firstChild; n; n = n.nextSibling) {
+            if (n.nodeType === 3) s += n.nodeValue;
+            else if (n.nodeType === 1) {
+                if (n.nodeName === 'BR' || BLOCK_RE.test(n.nodeName)) break;
+                s += n.textContent;
+            }
+        }
+        return s;
+    }
+    function refreshBlock(b, box){
+        if (b.closest('.text-box') !== box) return;
+        setMark(b, wantsLtr(ownLineText(b)));
+    }
+    function refreshBoxRoot(box){ setMark(box, wantsLtr(ownLineText(box))); }
+    function refreshBoxAll(box){
+        refreshBoxRoot(box);
+        var list = box.querySelectorAll(BLOCK_SEL);
+        for (var i = 0; i < list.length; i++) refreshBlock(list[i], box);
+    }
+    // Only the line being edited (and its ancestors) — cheap for long notes.
+    function refreshBoxCaret(box){
+        refreshBoxRoot(box);
+        var sel = window.getSelection && window.getSelection();
+        var n = sel && sel.anchorNode;
+        if (!n || !box.contains(n)) return;
+        if (n.nodeType === 3) n = n.parentNode;
+        while (n && n !== box) {
+            if (n.nodeType === 1 && n.matches && n.matches(BLOCK_SEL)) refreshBlock(n, box);
+            n = n.parentNode;
+        }
+    }
+    function boxOf(t){
+        return t && t.closest ? t.closest('.text-box[contenteditable="true"]') : null;
+    }
+
+    function onInput(e){
+        var t = e.target;
+        if (isTextField(t)) { refreshField(t); return; }
+        var box = boxOf(t);
+        if (!box) return;
+        var it = e.inputType || '';
+        if (/^(insertFromPaste|insertFromDrop|history|deleteByCut|insertReplacementText)/.test(it)) refreshBoxAll(box);
+        else refreshBoxCaret(box);
+    }
+    function onFocusIn(e){
+        var t = e.target;
+        if (isTextField(t)) { refreshField(t); return; }
+        var box = boxOf(t);
+        if (box) refreshBoxAll(box);
+    }
+    document.addEventListener('input', onInput, true);
+    document.addEventListener('compositionend', onInput, true);
+    document.addEventListener('focusin', onFocusIn, true);
+    document.addEventListener('keyup', function(e){
+        // Enter / arrows can move the caret to another line without an input event.
+        var box = boxOf(e.target);
+        if (box) refreshBoxCaret(box);
+    }, true);
+
+    // Initial pass for fields already on the page with a prefilled "@..." value.
+    function initialPass(){
+        var f = document.querySelectorAll('input,textarea');
+        for (var i = 0; i < f.length; i++) if (isTextField(f[i])) refreshField(f[i]);
+        var b = document.querySelectorAll('.text-box[contenteditable="true"]');
+        for (var j = 0; j < b.length; j++) refreshBoxAll(b[j]);
+    }
+    if (document.readyState === 'complete') setTimeout(initialPass, 0);
+    else window.addEventListener('load', function(){ setTimeout(initialPass, 300); });
+})();
+</script>
 </body>
 </html>
