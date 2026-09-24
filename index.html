@@ -15104,50 +15104,42 @@ window.mu_syncHtmlBg = function(){
                         return;
                     }
                     if (!data || !Array.isArray(data.categories)) throw new Error('Invalid backup');
-                    // Unlike CSV/TXT import (which add notes alongside existing ones), restoring
-                    // a JSON backup replaces the entire dataset — make sure that's really what
-                    // the person wants before any existing note/folder is overwritten.
-                    const backupIds = new Set(data.categories.filter(x => x && typeof x === 'object').map(x => String(x.id)));
-                    const keepLocked = categories.filter(c => c && isNoteLocked(c) && !c.isDecoy && !backupIds.has(String(c.id)));
-                    const confirmMsg = currentLang === 'fa'
-                        ? `این کار همه یادداشت‌ها و پوشه‌های فعلی (${categories.length} یادداشت) را با محتوای این فایل بکاپ جایگزین می‌کند و قابل بازگشت نیست. ادامه می‌دهید؟`
-                        : `This will replace ALL current notes and folders (${categories.length} notes) with the contents of this backup file and cannot be undone. Continue?`;
-                    const keepMsg = keepLocked.length
-                        ? (currentLang === 'fa'
-                            ? `\n\n${keepLocked.length} یادداشت قفل‌شده که در این فایل نیستند حفظ می‌شوند.`
-                            : `\n\n${keepLocked.length} locked note(s) that are not in this file will be kept.`)
-                        : '';
-                    if (!confirm(confirmMsg + keepMsg)) return;
-                        categories = data.categories.filter(x => x && typeof x === 'object').map((item, index) => normalizeCategory(item, index));
-                    categories.forEach(item => {
-                        if (isNoteLocked(item)) { item.html = ''; item.text = ''; item.isDecoy = false; }
-                        else item.html = sanitizeHtml(item.html || item.text || '');
+                    // Like CSV/TXT import, restoring a JSON backup now adds its notes/folders
+                    // alongside whatever is already here — nothing existing is overwritten or
+                    // removed. Each imported note keeps its original id unless that id is
+                    // already in use locally, in which case it gets a fresh one so the two
+                    // notes don't collide.
+                    const existingIds = new Set(categories.map(c => String(c.id)));
+                    const incoming = data.categories.filter(x => x && typeof x === 'object').map((item, index) => {
+                        const norm = normalizeCategory(item, index);
+                        const originalId = norm.id;
+                        if (existingIds.has(String(norm.id))) norm.id = `${Date.now()}_${index}_${Math.random().toString(36).slice(2,8)}`;
+                        existingIds.add(String(norm.id));
+                        if (isNoteLocked(norm)) { norm.html = ''; norm.text = ''; norm.isDecoy = false; }
+                        else norm.html = sanitizeHtml(norm.html || norm.text || '');
+                        // Older backups (from before Time Capsule/Ghost Note/Decay moved onto the
+                        // note itself) kept those fields in a separate advancedMeta blob — apply
+                        // it onto the matching notes here so an old backup still restores correctly.
+                        const m = data.advancedMeta && typeof data.advancedMeta === 'object' ? data.advancedMeta[originalId] : null;
+                        if (m && typeof m === 'object') {
+                            if (!norm.unlockAt && m.unlockAt) norm.unlockAt = m.unlockAt;
+                            if (!norm.ghostUntil && m.ghostUntil) norm.ghostUntil = m.ghostUntil;
+                            if (!norm.decayLevel && m.decayLevel) norm.decayLevel = m.decayLevel;
+                            if (m.manualDecay) norm.decayManual = true;
+                        }
+                        return norm;
                     });
-                    keepLocked.forEach(n => { if (!categories.some(c => String(c.id) === String(n.id))) categories.push(n); });
                     const importedFolders = Array.isArray(data.folders) ? data.folders.filter(f => typeof f === 'string' && f.trim()) : [];
-                    folders = [DEFAULT_FOLDER, ...[...new Set(importedFolders.filter(f => f !== 'همه' && f !== 'All' && f !== DEFAULT_FOLDER).map(f => f.trim()))]];
-                    keepLocked.forEach(n => { if (n.folder && !folders.includes(n.folder)) folders.push(n.folder); });
-                    categories.forEach(item => { if (item.folder && !folders.includes(item.folder)) item.folder = ''; });
-                    currentFolder = folders.includes(currentFolder) ? currentFolder : DEFAULT_FOLDER;
-                    // Older backups (from before Time Capsule/Ghost Note/Decay moved onto the
-                    // note itself) kept those fields in a separate advancedMeta blob — apply
-                    // it onto the matching notes here so an old backup still restores correctly.
-                    if (data.advancedMeta && typeof data.advancedMeta === 'object') {
-                        categories.forEach(item => {
-                            const m = data.advancedMeta[item.id];
-                            if (!m || typeof m !== 'object') return;
-                            if (!item.unlockAt && m.unlockAt) item.unlockAt = m.unlockAt;
-                            if (!item.ghostUntil && m.ghostUntil) item.ghostUntil = m.ghostUntil;
-                            if (!item.decayLevel && m.decayLevel) item.decayLevel = m.decayLevel;
-                            if (m.manualDecay) item.decayManual = true;
-                        });
-                    }
+                    [...new Set(importedFolders.filter(f => f !== 'همه' && f !== 'All' && f !== DEFAULT_FOLDER).map(f => f.trim()))]
+                        .forEach(f => { if (!folders.includes(f)) folders.push(f); });
+                    incoming.forEach(item => { if (item.folder && !folders.includes(item.folder)) item.folder = ''; });
+                    categories.push(...incoming);
                     saveToLocalStorage();
                     saveFoldersToLocalStorage();
                     await mu_flushStorage();
                     activeOpenId = null;
                     renderApp();
-                    showToast(currentLang === 'fa' ? 'بکاپ با موفقیت بازیابی شد.' : 'Backup restored successfully.');
+                    showToast(currentLang === 'fa' ? `${incoming.length} یادداشت از بکاپ اضافه شد.` : `${incoming.length} note(s) added from backup.`);
                 } catch(err) {
                     alert(currentLang === 'fa' ? 'فایل بکاپ معتبر نیست.' : 'Invalid backup file.');
                 } finally {
