@@ -20912,7 +20912,19 @@ window.runSmartSearch = mu_openSmartSearchModal;
 
 
 /* ---------- AI settings modal ---------- */
+// Tracks the custom-provider id created while the person is still in the
+// middle of the "Add new provider" flow (set the moment "Test connection"
+// or "Create & select" first creates it). Bug fix: without this, clicking
+// "Test connection" more than once while creating a new provider — very
+// normal when a first attempt fails and you fix the Base URL/key and try
+// again — used to call addCustomProvider() again each time, since the
+// dropdown's value stayed "__add_new__" the whole time. That silently
+// spawned a new duplicate "ghost" provider entry per click. Now the first
+// click creates it and remembers its id; later clicks (Test or the final
+// Create & select) update that same entry instead of creating another one.
+let mu_pendingNewProviderId = null;
 function mu_openAiSettingsModal(){
+    mu_pendingNewProviderId = null;
     const fa = currentLang==='fa';
     const s = MarkhinAI.getSettings();
     const activeId = s.activeId || 'openai';
@@ -20953,7 +20965,7 @@ function mu_openAiSettingsModal(){
 
             <label>${fa?'کلید API':'API Key'}</label>
             <input type="password" id="muAiKey" value="${escapeHtml(fields.apiKey||'')}" placeholder="sk-...">
-            <label>${isCustom
+            <label id="muAiModelLabel">${isCustom
                 ? (fa?'مدل (الزامی — نام دقیق مدل همان سرویس)':'Model (required — the exact model name from that service)')
                 : (fa?'مدل (اختیاری — پیش‌فرض دارد)':'Model (optional — has a default)')}</label>
             <div style="display:flex;gap:6px;align-items:center">
@@ -21022,7 +21034,7 @@ function mu_renderAiBudgetSection(fa){
     const fmtTok = n => (n||0).toLocaleString(fa?'fa-IR':'en-US');
     return `
         <div class="markhin-ai-settings-row" style="margin-top:10px">
-            <label>🎯 ${fa?'بودجه هوش مصنوعی (سقف روزانه/ماهانه)':'AI budget (daily/monthly cap)'}</label>
+            <label>🎯 ${fa?'بودجه هوش مصنوعی (اختیاری — سقف روزانه/ماهانه)':'AI budget (optional — daily/monthly cap)'}</label>
             <p style="opacity:.6;font-size:10.5px;line-height:1.8;margin:0">${fa
                 ? 'هر کدام از این چهار سقف را که پر کنی فعال می‌شود؛ خالی یعنی بدون محدودیت. وقتی مصرف نزدیک سقف (پیش‌فرض ۸۰٪) یا از آن عبور کند، Markhin داخل همان چت یک پیام هشدار نشان می‌دهد. این مجموع مصرفِ همه‌ی قابلیت‌های AI برنامه است (چت، ترجمه، خلاصه‌سازی، برچسب‌ها...)، نه فقط این یک ارائه‌دهنده.'
                 : "Fill in any of these four caps to activate it — leave blank for no limit. When usage gets close to a cap (80% by default) or passes it, Markhin shows a warning inside the chat. This totals usage across every AI feature in the app (chat, translate, summarize, tags...), not just this one provider."}</p>
@@ -21034,24 +21046,60 @@ function mu_renderAiBudgetSection(fa){
                 <input type="number" id="muAiBudgetDayTok" min="0" step="1000" value="${b.dailyCapTokens||''}" placeholder="${fa?'سقف روزانه (توکن)':'Daily cap (tokens)'}" style="flex:1;min-width:120px">
                 <input type="number" id="muAiBudgetMonthTok" min="0" step="1000" value="${b.monthlyCapTokens||''}" placeholder="${fa?'سقف ماهانه (توکن)':'Monthly cap (tokens)'}" style="flex:1;min-width:120px">
             </div>
-            <button type="button" class="btn-main" onclick="mu_saveAiBudget()">💾 ${fa?'ذخیره بودجه':'Save budget'}</button>
+            <div id="muAiBudgetWarn" style="display:none;font-size:10.5px;line-height:1.8;margin:0;color:#e8b93a"></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:2px">
+                <button type="button" class="btn-main" style="flex:1;min-width:140px" onclick="mu_saveAiBudget()">💾 ${fa?'ذخیره بودجه':'Save budget'}</button>
+                <button type="button" class="btn-main" style="flex:1;min-width:140px" onclick="mu_clearAiBudget()">🧹 ${fa?'پاک کردن سقف‌ها':'Clear caps'}</button>
+            </div>
             <p style="opacity:.75;font-size:11px;line-height:1.9;margin:6px 0 0">${fa
                 ? `مصرف امروز: ${fmtTok(log.dayTokens)} توکن${log.dayCostUSD?(' · ~'+fmtUsd(log.dayCostUSD)):''} — مصرف این ماه: ${fmtTok(log.monthTokens)} توکن${log.monthCostUSD?(' · ~'+fmtUsd(log.monthCostUSD)):''}`
                 : `Today's usage: ${fmtTok(log.dayTokens)} tokens${log.dayCostUSD?(' · ~'+fmtUsd(log.dayCostUSD)):''} — This month: ${fmtTok(log.monthTokens)} tokens${log.monthCostUSD?(' · ~'+fmtUsd(log.monthCostUSD)):''}`}</p>
         </div>`;
 }
 
-window.mu_saveAiBudget = function(){
-    const fa = currentLang==='fa';
+// Reads the four cap inputs and flags an obviously inconsistent combo (a
+// monthly cap set lower than the daily cap) before saving — previously
+// this went through silently and the monthly cap would just cut usage off
+// before the daily one ever had a chance to, which looks like the daily
+// cap "doesn't work" from the user's side.
+function mu_readAiBudgetForm(){
     const num = id => { const v = parseFloat((document.getElementById(id)||{}).value); return (v > 0) ? v : null; };
-    MarkhinAI.saveBudgetSettings({
+    return {
         dailyCapUSD: num('muAiBudgetDayUsd'),
         monthlyCapUSD: num('muAiBudgetMonthUsd'),
         dailyCapTokens: num('muAiBudgetDayTok'),
-        monthlyCapTokens: num('muAiBudgetMonthTok'),
-        warnPct: 80
-    });
+        monthlyCapTokens: num('muAiBudgetMonthTok')
+    };
+}
+window.mu_saveAiBudget = function(){
+    const fa = currentLang==='fa';
+    const b = mu_readAiBudgetForm();
+    MarkhinAI.saveBudgetSettings({ dailyCapUSD:b.dailyCapUSD, monthlyCapUSD:b.monthlyCapUSD, dailyCapTokens:b.dailyCapTokens, monthlyCapTokens:b.monthlyCapTokens, warnPct:80 });
+    const warnEl = document.getElementById('muAiBudgetWarn');
+    const inconsistent = (b.dailyCapUSD && b.monthlyCapUSD && b.dailyCapUSD > b.monthlyCapUSD)
+        || (b.dailyCapTokens && b.monthlyCapTokens && b.dailyCapTokens > b.monthlyCapTokens);
+    if(warnEl){
+        if(inconsistent){
+            warnEl.style.display = 'block';
+            warnEl.textContent = fa
+                ? '⚠️ سقف روزانه از سقف ماهانه بیشتر است — سقف ماهانه زودتر می‌رسد و عملاً سقف روزانه اثری نخواهد داشت.'
+                : "⚠️ The daily cap is higher than the monthly cap — the monthly cap will be hit first, so the daily cap won't have any real effect.";
+        } else {
+            warnEl.style.display = 'none';
+        }
+    }
     showToast(fa ? 'بودجه ذخیره شد.' : 'Budget saved.');
+};
+window.mu_clearAiBudget = function(){
+    const fa = currentLang==='fa';
+    MarkhinAI.saveBudgetSettings({ dailyCapUSD:null, monthlyCapUSD:null, dailyCapTokens:null, monthlyCapTokens:null, warnPct:80 });
+    ['muAiBudgetDayUsd','muAiBudgetMonthUsd','muAiBudgetDayTok','muAiBudgetMonthTok'].forEach(id=>{
+        const el = document.getElementById(id);
+        if(el) el.value = '';
+    });
+    const warnEl = document.getElementById('muAiBudgetWarn');
+    if(warnEl) warnEl.style.display = 'none';
+    showToast(fa ? 'سقف‌های بودجه پاک شد.' : 'Budget caps cleared.');
 };
 
 // The Base URL label/placeholder depend on the selected provider (built-in
@@ -21059,12 +21107,22 @@ window.mu_saveAiBudget = function(){
 // need one). The modal isn't re-rendered on dropdown change, so refresh here.
 window.mu_updateBaseUrlHints = function(id){
     const fa = currentLang==='fa';
-    const isCustom = String(id||'').indexOf('custom:') === 0;
+    // "__add_new__" (still picking a name/format/Base URL for a brand-new
+    // custom provider) needs the same "required" wording as an existing
+    // custom provider — it was previously left out of this check, so the
+    // shared Model/Base URL labels kept showing whatever built-in provider
+    // was selected before, even though a new custom provider always needs
+    // its own model name and Base URL.
+    const isCustom = String(id||'').indexOf('custom:') === 0 || id === '__add_new__';
     const label = document.getElementById('muAiBaseLabel');
     const baseEl = document.getElementById('muAiBase');
+    const modelLabel = document.getElementById('muAiModelLabel');
     if(label) label.textContent = isCustom
         ? (fa?'Base URL (الزامی)':'Base URL (required)')
         : (fa?'Base URL (اختیاری — پیش‌فرض دارد)':'Base URL (optional — has a default)');
+    if(modelLabel) modelLabel.textContent = isCustom
+        ? (fa?'مدل (الزامی — نام دقیق مدل همان سرویس)':'Model (required — the exact model name from that service)')
+        : (fa?'مدل (اختیاری — پیش‌فرض دارد)':'Model (optional — has a default)');
     if(baseEl){
         const preset = (!isCustom && window.MU_AI_BUILTINS) ? window.MU_AI_BUILTINS[id] : null;
         baseEl.placeholder = preset ? preset.defaultBaseUrl : 'https://openrouter.ai/api/v1';
@@ -21077,8 +21135,33 @@ window.mu_onProviderPick = function(value){
     if(modelsBox){ modelsBox.style.display = 'none'; modelsBox.innerHTML = ''; }
     if(value === '__add_new__'){
         if(box) box.style.display = 'flex';
+        // Bug fix: this used to leave whatever key/model/Base URL were
+        // filled in for the previously-selected provider sitting in the
+        // shared fields below. Since "Create & select" and "Test
+        // connection" both read the API key and model from those same
+        // shared fields, that meant a brand-new custom provider could
+        // silently inherit another provider's leftover key/model without
+        // the person noticing (and the shared Base URL field kept showing
+        // an old value even though it isn't the one actually used for a
+        // new provider — that's the dashed box's own Base URL field).
+        // Clearing them here gives every new provider a clean start, and
+        // updating the labels/placeholder makes clear this is a fresh
+        // custom entry.
+        const keyElNew = document.getElementById('muAiKey');
+        const modelElNew = document.getElementById('muAiModel');
+        const baseElNew = document.getElementById('muAiBase');
+        if(keyElNew) keyElNew.value = '';
+        if(modelElNew) modelElNew.value = '';
+        if(baseElNew) baseElNew.value = '';
+        if(window.mu_updateBaseUrlHints) window.mu_updateBaseUrlHints('__add_new__');
+        mu_pendingNewProviderId = null;
+        const nameEl = document.getElementById('muAiNewName');
+        if(nameEl){ nameEl.value=''; setTimeout(()=>nameEl.focus(), 0); }
+        const newBaseEl = document.getElementById('muAiNewBase');
+        if(newBaseEl) newBaseEl.value = '';
         return;
     }
+    mu_pendingNewProviderId = null;
     if(box) box.style.display = 'none';
     const fields = MarkhinAI.getProviderFields(value);
     if(!fields) return;
@@ -21122,11 +21205,25 @@ window.mu_confirmNewProvider = function(){
     const baseUrl = ((document.getElementById('muAiNewBase')||{}).value||'').trim();
     const apiKey = mu_sanitizeApiKeyValue((document.getElementById('muAiKey')||{}).value||'').value;
     const model = ((document.getElementById('muAiModel')||{}).value||'').trim();
+    const maxTokens = mu_normalizeMaxTokens((document.getElementById('muAiMaxTokens')||{}).value);
+    const smartEl = document.getElementById('muAiSmartTokens');
+    const smartTokens = smartEl ? !!smartEl.checked : true;
+    const priceIn = ((document.getElementById('muAiPriceIn')||{}).value || '').trim();
+    const priceOut = ((document.getElementById('muAiPriceOut')||{}).value || '').trim();
     if(!name){ showToast(fa?'یک نام برای ارائه‌دهنده وارد کن.':'Give the provider a name.'); return; }
     if(!baseUrl){ showToast(fa?'برای ارائه‌دهنده سفارشی، Base URL لازم است.':'A custom provider needs a Base URL.'); return; }
     const styleElNP = document.getElementById('muAiStyle');
     if(styleElNP) MarkhinAI.setStyle(styleElNP.value);
-    MarkhinAI.addCustomProvider({ name, format, baseUrl, apiKey, model });
+    // Bug fix: if "Test connection" already created this provider earlier
+    // in the same "Add new provider" session (see mu_pendingNewProviderId
+    // above), update that same entry instead of pushing a second, duplicate
+    // one with the same name.
+    if(mu_pendingNewProviderId){
+        MarkhinAI.saveProviderFields('custom:'+mu_pendingNewProviderId, { name, format, baseUrl, apiKey, model, maxTokens, smartTokens, priceIn, priceOut });
+    } else {
+        const newId = MarkhinAI.addCustomProvider({ name, format, baseUrl, apiKey, model, maxTokens, smartTokens, priceIn, priceOut });
+        mu_pendingNewProviderId = newId.slice(7);
+    }
     showToast(fa?'ارائه‌دهنده اضافه شد.':'Provider added.');
     mu_openAiSettingsModal();
 };
@@ -21189,7 +21286,19 @@ window.mu_testAiSettings = async function(){
         const format = (document.getElementById('muAiNewFormat')||{}).value || 'openai';
         const baseUrl = ((document.getElementById('muAiNewBase')||{}).value||'').trim();
         if(!name || !baseUrl){ if(el) el.textContent = currentLang==='fa' ? '⚠️ ابتدا نام و Base URL را وارد کن.' : '⚠️ Fill in a name and Base URL first.'; return; }
-        MarkhinAI.addCustomProvider({ name, format, baseUrl, apiKey:f.apiKey, model:f.model });
+        // Bug fix: previously every "Test connection" click while creating
+        // a new provider called addCustomProvider() again, so testing
+        // twice (e.g. fixing a typo after a failed first test) left behind
+        // a duplicate "ghost" provider in the list. Now the first test
+        // creates it and remembers the id (mu_pendingNewProviderId); a
+        // second test on the same not-yet-confirmed provider updates that
+        // same entry instead of creating another one.
+        if(mu_pendingNewProviderId){
+            MarkhinAI.saveProviderFields('custom:'+mu_pendingNewProviderId, { name, format, baseUrl, apiKey:f.apiKey, model:f.model, maxTokens:f.maxTokens, smartTokens:f.smartTokens, priceIn:f.priceIn, priceOut:f.priceOut });
+        } else {
+            const newId = MarkhinAI.addCustomProvider({ name, format, baseUrl, apiKey:f.apiKey, model:f.model, maxTokens:f.maxTokens, smartTokens:f.smartTokens, priceIn:f.priceIn, priceOut:f.priceOut });
+            mu_pendingNewProviderId = newId.slice(7);
+        }
     } else {
         MarkhinAI.saveProviderFields(f.id, f);
     }
@@ -21229,7 +21338,18 @@ window.mu_fetchAiModelsList = async function(){
     let baseUrl = ((document.getElementById('muAiBase')||{}).value||'').trim();
     if(id === '__add_new__'){
         format = (document.getElementById('muAiNewFormat')||{}).value || 'openai';
-        if(!baseUrl) baseUrl = ((document.getElementById('muAiNewBase')||{}).value||'').trim();
+        // Bug fix: this used to only fall back to the "Add new provider"
+        // box's own Base URL field when the shared field above was empty —
+        // but that shared field is the OLD field still tied to whatever
+        // provider was selected before "Add new provider" was picked
+        // (still visible on screen, if only for the labels). In practice
+        // that meant "Fetch models" while creating a new provider almost
+        // always ignored the Base URL the person had just typed and
+        // silently queried the previous provider's URL instead. The new
+        // provider's own Base URL field is always the right source here,
+        // so it now takes priority.
+        const newBaseUrl = ((document.getElementById('muAiNewBase')||{}).value||'').trim();
+        if(newBaseUrl) baseUrl = newBaseUrl;
     } else if(id.indexOf('custom:') === 0){
         const cf = MarkhinAI.getProviderFields(id);
         format = (cf && cf.format) || 'openai';
@@ -39965,14 +40085,33 @@ const MU_AI = (function(){
         box.addEventListener('pointerleave', function(ev){ if (dragEl) finish(); });
     }
 
+    // MARKHIN AI messages are stored as the same lightweight markdown
+    // subset that markdownToSafeHtml() renders (**bold**, *italic*,
+    // `code`, #/##/### headers, [text](url) links). Copying that raw
+    // source verbatim (previous behavior) left the literal ** / * / ` / #
+    // characters in whatever the user pasted into — e.g. Telegram, which
+    // doesn't treat single-asterisk markdown the same way, so bold text
+    // showed up as bare asterisks. This strips that syntax down to plain
+    // text first, mirroring (in reverse) the exact same patterns
+    // markdownToSafeHtml() converts to HTML, so copied text always reads
+    // the way the bubble visually renders it.
+    function mAi_markdownToPlainText(md){
+        let text = String(md == null ? '' : md).replace(/\r\n?/g, '\n');
+        text = text.replace(/^#{1,3} (.+)$/gm, '$1');
+        text = text.replace(/\*\*(.+?)\*\*/g, '$1').replace(/\*(.+?)\*/g, '$1').replace(/`([^`]+)`/g, '$1');
+        text = text.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '$1 ($2)');
+        return text;
+    }
+
     // Tapping the 📋 on any bubble (own message or MARKHIN AI's) copies
-    // that message's raw text (not the rendered/formatted HTML) to the
-    // clipboard. Same clipboard + legacy execCommand fallback pattern
-    // used elsewhere in the app (see specialToolsCopyText).
+    // that message's text, with the markdown syntax above stripped to
+    // plain text, to the clipboard. Same clipboard + legacy execCommand
+    // fallback pattern used elsewhere in the app (see
+    // specialToolsCopyText).
     async function mAi_copyMsg(id){
         const msg = mAiHistory.find(function(m){ return m.id === id; });
         const fa = currentLang === 'fa';
-        const text = msg ? String(msg.content || '') : '';
+        const text = msg ? mAi_markdownToPlainText(msg.content || '') : '';
         if(!text.trim()){ showToast(fa ? 'چیزی برای کپی نیست.' : 'Nothing to copy.'); return; }
         const legacyCopy = function(){
             try{
@@ -44694,7 +44833,7 @@ const MU_AI = (function(){
         }).join('\n\n').slice(0,totalBudget);
 
 
-        const toolsSummaryFa = '🔎 پیدا کردن یادداشت، 📖 خواندن متن کامل یک یادداشت، ➕ ساخت یادداشت جدید (با فرمت‌بندی)، 📝 ویرایش/بازنویسی متن یادداشت (بولد، ایتالیک، تیتر، لیست و...)، 📄 ساخت کپی از یک یادداشت، 🔒 قفل‌کردن واقعیِ یک یادداشت با رمز (باز کردن دیالوگ امن رمزگذاری خودِ برنامه)، ✏️ تغییر عنوان، 🔤 تغییر فونت/سایز یک یادداشت، ⌛ تنظیم دستی/خودکار سطح فرسودگی، 📁 انتقال به/خروج از پوشه، ➕📁 ساخت/تغییرنام/حذف پوشه، 🏷️ تگ‌گذاری، 📌 پین، ⭐ فیوریت، 📦 آرشیو/بازگردانی، ⏳ فعال/غیرفعال‌کردن کپسول زمانی (قفل یک یادداشت تا زمان مشخص)، 👻 فعال/لغو Ghost Note (خودکار حذف‌شدن یادداشت بعد از چند ساعت)، ⚰️ دیدن لیست گورستان، ♻️ بازیابی یادداشت حذف‌شده از آن، و 🗑️ حذف دائمی و برگشت‌ناپذیر یک یادداشت از گورستان (حتی اگر آن یادداشت قبل از حذف‌شدن قفل بوده باشد — همیشه با تأیید واقعی کاربر)، 🧰 اعمال یک تغییر روی چند یادداشت هم‌زمان بر اساس پوشه/تگ/جستجو (تگ‌گذاری، آرشیو، پین، فیوریت، یا جابجایی گروهی)، 🔗 ترکیب چند یادداشت، 🗑️ حذف (حتی یادداشتِ قفل، و در صورت درخواست به‌صورت دائمی/بدون عبور از گورستان — همیشه با تأیید واقعی کاربر)، 🎨 تغییر تم ظاهری، 🌐 تغییر زبان برنامه، 📤 خروجی‌گرفتن واقعی از یادداشت‌ها (JSON/CSV/MD/TXT/PDF/DOCX/PNG/JPG — دانلود واقعی، نه فقط توضیح)، 📝📎 ساخت یک فایل کاملاً جدید (نه از روی یادداشت) از محتوایی که خودت همین الان می‌نویسی — TXT، JSON (اعتبارسنجی‌شده)، CSV، HTML یا Markdown — و ارسال واقعی همان فایل برای کاربر همین‌جا توی چت، 🌌 باز کردن شبکه دانش/گورستان/پورتال رندوم/منطقه بازی (الان پنج بازی داخلش قابل بازی است: Night Driver — ماشین‌سواری شبانه‌ی نئونی، Monster Hunt — فرار از دسته‌ای از هیولاها، Chaos Orb (گوی آشوب) — بازیِ گوی نورانی که هر چند ثانیه یه «قانون آشوب» تصادفی همه‌چی رو عوض می‌کنه، Trap Devil (فرار از تله‌های شیطون) — یه پلتفرمر بی‌رحم و بدون چک‌پوینت پر از تله‌های ناغافل، و Toward Hell (به سمت جهنم) — سقوط از نُه طبقهٔ جهنم توی یه جادهٔ شبه‌سه‌بعدی که هر چند ثانیه یه «قانون شیطونی» تصادفی قوانین بازی رو عوض می‌کنه)، 🧬 مقایسه چند یادداشت و پیدا کردن اشتراکات (تگ مشترک، کلمات/موضوع مشترک)، 📊 آمار کامل داشبورد (تعداد کل، پین‌شده‌ها، فیوریت‌ها، پوشه‌ها، تگ‌ها)، 📚 خواندن چند یادداشت کامل در یک درخواست (برای خلاصه‌سازی/مقایسه گروهی)، 🗂️ خواندن متن کامل *همه* یادداشت‌های در‌دسترس با هم در یک درخواست (برای مرور/خلاصه‌سازی/جستجوی کامل کل واقت)، ➕📚 ساخت چند یادداشت هم‌زمان در یک درخواست، 🧭 پیدا کردن یادداشت‌های خیلی شبیه/تکراری در کل واقتان، ↕️ جابجایی دقیق یک یادداشت در لیست (بردن به بالا/پایین یا درست قبل/بعد از یادداشتی دیگر)، 🔀 مرتب‌سازی یک‌جای همه یادداشت‌ها یا یک پوشه بر اساس الفبا/تاریخ ویرایش/طول، 👁️ فعال/غیرفعال‌کردن پیش‌نمایش (خط خلاصه‌ی زیر عنوان هر یادداشت در لیست) در کل برنامه، 🧩 پیشنهاد پوشه‌بندی خودکار یادداشت‌های مرتبط بر اساس تگ و محتوای مشترک، 🕰️ دسترسی به بخش‌های قدیمی‌تر همین گفتگو که در حافظه فعلی‌ات نیست (مثل اولین پیامی که کاربر فرستاده)، و 🌍 دیدن تاریخ/ساعت دقیق در هر نقطه از دنیا (هر کشور/شهر/ایالت یا ساعت جهانی UTC)، و 🧮 انجام محاسبات دقیقِ ریاضی (درصد، توان، جذر، محاسبات چندمرحله‌ای و…) با یک ابزار محاسبه‌گرِ واقعی به‌جای حدس‌زدن، و 📅 تبدیل دقیق و قطعیِ هر تاریخِ مشخص بین تقویم شمسی و میلادی (همراه با روز هفته و فاصله تا امروز) با یک ابزار واقعی به‌جای حدس‌زدن یا تبدیل‌کردن در ذهن، و 📡🔢 تبدیل دقیق متن به/از کد مورس یا کد باینری با استفاده از جدول واقعیِ خودِ برنامه به‌جای حدس‌زدن نقطه/خط یا بیت، و 💾 تخمینِ تقریبیِ میزان پرشدگی/آزاد بودنِ فضای ذخیره‌سازی برنامه با استفاده از قابلیت خودِ مرورگر (همیشه به‌عنوان یک عدد تقریبی، نه دقیق)، و 🗓️ ساخت خلاصه‌ی هفتگی/ماهانه (یا هر بازه‌ی دلخواه) از یادداشت‌ها همراه با آمار و تم‌های تکراری، و ⚖️ پیدا کردن جمله‌های احتمالاً متناقض بین یادداشت‌ها (مثل «اینجا X نوشتی ولی جای دیگر برعکسش»)، و 🧭 جست‌وجوی معنایی — پیدا کردن یادداشت بر اساس مفهوم و معنی حتی اگر کلمه‌ی دقیقش در آن نباشد، و ☁️ گرفتن بکاپ واقعیِ دستی از یادداشت‌ها روی Telegram Cloud Storage (با برچسب دلخواه کاربر، یا اگر چیزی نگفت با یک برچسبِ خودکارِ «بکاپ + تاریخ و ساعت»)، دیدن لیست بکاپ‌های موجود (خودکار و دستی)، و حذف واقعیِ یک بکاپ دستی (همیشه با تأیید واقعی کاربر)';
+        const toolsSummaryFa = '🔎 پیدا کردن یادداشت، 📖 خواندن متن کامل یک یادداشت، ➕ ساخت یادداشت جدید (با فرمت‌بندی)، 📝 ویرایش/بازنویسی متن یادداشت (بولد، ایتالیک، تیتر، لیست و...)، 📄 ساخت کپی از یک یادداشت، 🔒 قفل‌کردن واقعیِ یک یادداشت با رمز (باز کردن دیالوگ امن رمزگذاری خودِ برنامه)، ✏️ تغییر عنوان، 🔤 تغییر فونت/سایز یک یادداشت، ⌛ تنظیم دستی/خودکار سطح فرسودگی، 📁 انتقال به/خروج از پوشه، ➕📁 ساخت/تغییرنام/حذف پوشه، 🏷️ تگ‌گذاری، 📌 پین، ⭐ فیوریت، 📦 آرشیو/بازگردانی، ⏳ فعال/غیرفعال‌کردن کپسول زمانی (قفل یک یادداشت تا زمان مشخص)، 👻 فعال/لغو Ghost Note (خودکار حذف‌شدن یادداشت بعد از چند ساعت)، ⚰️ دیدن لیست گورستان، ♻️ بازیابی یادداشت حذف‌شده از آن، و 🗑️ حذف دائمی و برگشت‌ناپذیر یک یادداشت از گورستان (حتی اگر آن یادداشت قبل از حذف‌شدن قفل بوده باشد — همیشه با تأیید واقعی کاربر)، 🧰 اعمال یک تغییر روی چند یادداشت هم‌زمان بر اساس پوشه/تگ/جستجو (تگ‌گذاری، آرشیو، پین، فیوریت، یا جابجایی گروهی)، 🔗 ترکیب چند یادداشت، 🗑️ حذف (حتی یادداشتِ قفل، و در صورت درخواست به‌صورت دائمی/بدون عبور از گورستان — همیشه با تأیید واقعی کاربر)، 🎨 تغییر تم ظاهری، 🌐 تغییر زبان برنامه، 📤 خروجی‌گرفتن واقعی از یادداشت‌ها (JSON/CSV/MD/TXT/PDF/DOCX/PNG/JPG — دانلود واقعی، نه فقط توضیح)، 📝📎 ساخت یک فایل کاملاً جدید (نه از روی یادداشت) از محتوایی که خودت همین الان می‌نویسی — TXT، JSON (اعتبارسنجی‌شده)، CSV، HTML یا Markdown — و ارسال واقعی همان فایل برای کاربر همین‌جا توی چت، 🌌 باز کردن شبکه دانش/گورستان/پورتال رندوم/منطقه بازی (الان پنج بازی داخلش قابل بازی است: Night Driver — ماشین‌سواری شبانه‌ی نئونی، Monster Hunt — فرار از دسته‌ای از هیولاها، Chaos Orb (گوی آشوب) — بازیِ گوی نورانی که هر چند ثانیه یه «قانون آشوب» تصادفی همه‌چی رو عوض می‌کنه، Trap Devil (فرار از تله‌های شیطون) — یه پلتفرمر بی‌رحم و بدون چک‌پوینت پر از تله‌های ناغافل، و Toward Hell (به سمت جهنم) — سقوط از نُه طبقهٔ جهنم توی یه جادهٔ شبه‌سه‌بعدی که هر چند ثانیه یه «قانون شیطونی» تصادفی قوانین بازی رو عوض می‌کنه)، 🧬 مقایسه چند یادداشت و پیدا کردن اشتراکات (تگ مشترک، کلمات/موضوع مشترک)، 📊 آمار کامل داشبورد (تعداد کل، پین‌شده‌ها، فیوریت‌ها، پوشه‌ها، تگ‌ها)، 📚 خواندن چند یادداشت کامل در یک درخواست (برای خلاصه‌سازی/مقایسه گروهی)، 🗂️ خواندن متن کامل *همه* یادداشت‌های در‌دسترس با هم در یک درخواست (برای مرور/خلاصه‌سازی/جستجوی کامل کل برنامه)، ➕📚 ساخت چند یادداشت هم‌زمان در یک درخواست، 🧭 پیدا کردن یادداشت‌های خیلی شبیه/تکراری در کل برنامه‌تان، ↕️ جابجایی دقیق یک یادداشت در لیست (بردن به بالا/پایین یا درست قبل/بعد از یادداشتی دیگر)، 🔀 مرتب‌سازی یک‌جای همه یادداشت‌ها یا یک پوشه بر اساس الفبا/تاریخ ویرایش/طول، 👁️ فعال/غیرفعال‌کردن پیش‌نمایش (خط خلاصه‌ی زیر عنوان هر یادداشت در لیست) در کل برنامه، 🧩 پیشنهاد پوشه‌بندی خودکار یادداشت‌های مرتبط بر اساس تگ و محتوای مشترک، 🕰️ دسترسی به بخش‌های قدیمی‌تر همین گفتگو که در حافظه فعلی‌ات نیست (مثل اولین پیامی که کاربر فرستاده)، و 🌍 دیدن تاریخ/ساعت دقیق در هر نقطه از دنیا (هر کشور/شهر/ایالت یا ساعت جهانی UTC)، و 🧮 انجام محاسبات دقیقِ ریاضی (درصد، توان، جذر، محاسبات چندمرحله‌ای و…) با یک ابزار محاسبه‌گرِ واقعی به‌جای حدس‌زدن، و 📅 تبدیل دقیق و قطعیِ هر تاریخِ مشخص بین تقویم شمسی و میلادی (همراه با روز هفته و فاصله تا امروز) با یک ابزار واقعی به‌جای حدس‌زدن یا تبدیل‌کردن در ذهن، و 📡🔢 تبدیل دقیق متن به/از کد مورس یا کد باینری با استفاده از جدول واقعیِ خودِ برنامه به‌جای حدس‌زدن نقطه/خط یا بیت، و 💾 تخمینِ تقریبیِ میزان پرشدگی/آزاد بودنِ فضای ذخیره‌سازی برنامه با استفاده از قابلیت خودِ مرورگر (همیشه به‌عنوان یک عدد تقریبی، نه دقیق)، و 🗓️ ساخت خلاصه‌ی هفتگی/ماهانه (یا هر بازه‌ی دلخواه) از یادداشت‌ها همراه با آمار و تم‌های تکراری، و ⚖️ پیدا کردن جمله‌های احتمالاً متناقض بین یادداشت‌ها (مثل «اینجا X نوشتی ولی جای دیگر برعکسش»)، و 🧭 جست‌وجوی معنایی — پیدا کردن یادداشت بر اساس مفهوم و معنی حتی اگر کلمه‌ی دقیقش در آن نباشد، و ☁️ گرفتن بکاپ واقعیِ دستی از یادداشت‌ها روی Telegram Cloud Storage (با برچسب دلخواه کاربر، یا اگر چیزی نگفت با یک برچسبِ خودکارِ «بکاپ + تاریخ و ساعت»)، دیدن لیست بکاپ‌های موجود (خودکار و دستی)، و حذف واقعیِ یک بکاپ دستی (همیشه با تأیید واقعی کاربر)';
         const toolsSummaryEn = 'finding notes, reading a note\'s full content, creating notes (with formatting), editing/rewriting a note\'s content (bold, italic, headings, lists, etc.), duplicating a note, actually password-locking a note (opening the app\'s own secure encryption dialog), renaming, changing a note\'s font/size, setting its decay/staleness level manually or back to automatic, moving into/out of a folder, creating/renaming/deleting folders, tagging, pinning, favoriting, archiving/restoring, arming/clearing a Time Capsule lock (a note that cannot reopen until a future date), arming/cancelling a Ghost Note self-destruct timer (a note that auto-deletes after a set number of hours), listing what\'s in the Cemetery, restoring a deleted note from it, and permanently/irreversibly erasing a note from the Cemetery for good (even one that was locked before it was deleted — always with a real user confirmation), applying one change to a whole group of notes at once by folder/tag/search (bulk tagging, archiving, pinning, favoriting, or moving), merging multiple notes, deleting a note — including a locked one, and optionally permanently/right away with no Cemetery step if asked for — (always with a real user confirmation), switching the app\'s visual theme, switching the app\'s language, actually exporting notes to a real downloaded file (JSON/CSV/MD/TXT/PDF/DOCX/PNG/JPG — a real download, not just instructions), creating a brand-new file (not from an existing note) out of content you write right in your reply — TXT, JSON (validated), CSV, HTML, or Markdown — and actually sending that file to the user right in this chat, opening the Knowledge Graph / Cemetery / Random Portal / Game views (the game page currently has five playable games: Night Driver — neon night racing; Monster Hunt — running from a pack of monsters; Chaos Orb — a glowing-orb survival game where a random chaos rule flips the world every few seconds; Trap Devil — a ruthless, no-checkpoints trap platformer full of fake floors, saws, and sneak-attack traps; and Toward Hell — a pseudo-3D road-falling game through nine circles of hell where a random devil\'s law changes the rules every few seconds), comparing multiple notes to find what they share (common tags, common words/themes), getting full dashboard stats (totals, pinned notes, favorite notes, folders, tags), batch-reading several notes\' full content in one request (for group summarizing/comparing), reading the full text of *every* accessible note at once in a single request (for reviewing/summarizing/searching the whole vault), batch-creating several notes in one request, scanning the whole vault for near-duplicate/highly overlapping notes, precisely repositioning a single note in its list (to the top/bottom or right before/after another note), resorting all notes (or one folder) at once by alphabet/edit-date/length, turning the note list\'s preview snippet (a short excerpt shown under each note\'s title) on or off app-wide, suggesting automatic folder groupings for related notes based on shared tags and content, looking up older parts of this very conversation that are no longer in your current context (e.g. the user\'s very first message), and checking the exact current date/time anywhere else in the world (any country, city, state/province, or UTC), and doing exact math (percentages, powers, roots, multi-step calculations, etc.) with a real calculator tool instead of estimating, and precisely converting any specific date between the Jalali (Shamsi) and Gregorian calendars — with its weekday and how far it is from today — using a real tool instead of guessing or converting it mentally, and precisely converting text to/from Morse code or binary (ASCII bit) code using the app\'s own exact character tables instead of working out dots/dashes or bits yourself, and estimating (never exactly, always approximately, via the browser\'s own storage API) how full/free the app\'s on-device storage currently is, and building a weekly/monthly (or any custom-period) summary of the notes with stats and recurring themes, spotting sentences that may contradict each other across notes (e.g. "here you wrote X but elsewhere you wrote the opposite"), and searching notes by meaning rather than exact words (finding a note from a description even when it does not contain the exact words), and creating a real manual Telegram Cloud Storage backup of the notes (with the user\'s own chosen label, or an auto-generated "Backup <date & time>" label if they don\'t give one), listing existing backups (auto and manual), and actually deleting a manual backup (always with a real user confirmation)';
 
         // Native, always-on live web search: when the active provider is
@@ -44765,7 +44904,8 @@ const MU_AI = (function(){
                 + '- بودجه‌ی فکرکردنِ عمیقِ داخلی‌ات (وقتی در دسترس است) قابل‌توجه است — از آن دریغ نکن؛ برای هر چیزِ واقعاً غیرِپیش‌پاافتاده، فرضیات را بررسی کن، حداقل یک راهِ جایگزین یا یک اشکالِ احتمالی در استدلالِ خودت را قبل از نهایی‌کردنِ جواب امتحان کن، و فقط وقتی که از درست‌بودنِ نتیجه مطمئن شدی آن را ارائه بده. کیفیت و دقتِ نهاییِ پاسخ روی سرعتِ رسیدن به آن اولویت دارد.\n'
                 + '- در نقشِ کارشناسِ عمومی، سطحِ پاسخ‌هایت باید در حدِ یک متخصصِ واقعی همان حوزه باشد: کامل، دقیق، دارای جزئیاتِ کاربردی و مثال‌های مشخص وقتی لازم است — نه یک خلاصه‌ی سطحی که فقط عنوانِ موضوع را تکرار می‌کند.\n'
                 + '- هرگز چیزی را که مطمئن نیستی به‌عنوان قطعی جا نزن؛ اگر یک عدد/تاریخ/محتوای دقیق یادداشت را حدس می‌زنی نه می‌دانی، یا خودت را با ابزار مطمئن کن (get_note/get_notes و مانند آن) یا صادقانه به کاربر بگو که مطمئن نیستی.\n'
-                + '- برای هر محاسبه‌ی ریاضی که کمی پیچیده‌تر از جمع/تفریق تک‌رقمی است (درصد، کسر، توان، جذر، محاسبات چندمرحله‌ای، یا هر جا که یک رقمِ اشتباه واقعاً مهم است)، به‌جای محاسبه‌ی ذهنیِ خودت، حتماً ابزار calculate را صدا بزن و نتیجه‌ی دقیقِ برگشتی از آن را در جواب بیاور.\n'
+                + '- خیلی مهم — هیچ محاسبه‌ی ریاضی را در ذهنِ خودت انجام نده، حتی اگر ساده به‌نظر برسد؛ همیشه ابزار calculate را صدا بزن و فقط نتیجه‌ی دقیقِ برگشتی از آن را در جواب بیاور. تنها استثنا جمع/تفریقِ واقعاً تک‌رقمی و بدیهی است (مثل ۲+۲)؛ برای هر چیزِ فراتر از آن — دو یا چندرقمی، درصد، کسر، توان، جذر، یا هر عملِ دیگر — همیشه ابزار را صدا بزن، چون حتی محاسباتی که «راحت» به‌نظر می‌رسند (مثل ضربِ دو عددِ دورقمی یا جمعِ چند عدد) در ذهنِ مدلِ زبانی گاهی یک رقم اشتباه می‌شوند و آن خطا کاملاً نامحسوس است.\n'
+                + '- خیلی مهم — برای هر محاسبه‌ی چندمرحله‌ای (مثلاً «۱۸٪ از مجموع سه عدد را حساب کن»، یا هر مسئله‌ای که چند گام پشتِ‌سرهم دارد)، تمام گام‌های میانی را هم با ابزار calculate بساز — یا با نوشتن کلِ عبارت در یک فراخوانی (مثل "(1200*3 + 450) / 7") یا با چند فراخوانیِ جداگانه — و هرگز نتیجه‌ی یک گام را در ذهنِ خودت با گامِ بعدی ترکیب نکن؛ فقط اعدادِ واقعاً برگشتی از ابزار را در محاسبه‌ی بعدی به‌کار ببر. وقتی عددِ ورودیِ یک محاسبه از خروجیِ ابزارِ دیگری می‌آید (مثلاً تعداد یادداشت‌ها، آمارِ داشبورد، یا مقدارِ برگشتی از get_period_digest)، همان عددِ دقیقِ ابزار را — نه تخمینِ خودت را — به calculate بده.\n'
                 + '- برای اعداد، ریاضیات، یا شمارش (مثلاً «چند تا یادداشت با تگ X دارم»، «مجموع...»)، به‌جای حدس‌زدن، واقعاً از داده‌ی برگشتی ابزارها بشمار/محاسبه کن.\n'
                 + '- وقتی کاربر عکسی ضمیمه کرده: کل تصویر را با دقت واقعی بررسی کن، نه یک نگاه سرسری — همه‌ی بخش‌های تصویر را از جمله گوشه‌ها و پس‌زمینه ببین، هر متنی که داخل تصویر است (تابلو، برچسب، اسکرین‌شات، سند، دست‌خط) را کلمه‌به‌کلمه و دقیق بخوان (نه فقط حدس از روی شکل کلی)، رنگ‌ها/تعداد/اندازه‌ی نسبی/چیدمان فضایی اشیاء را دقیق توصیف کن، و اگر سوال کاربر به یک جزئیات خیلی کوچک یا گوشه‌ی خاصی از تصویر مربوط است، دقیقاً همان‌جا را بررسی کن نه کل تصویر را کلی‌گویی. اگر بخشی از تصویر تار، بریده، خیلی کوچک یا واقعاً غیرقابل‌تشخیص است، به‌جای حدس‌زدنِ قطعی، صادقانه بگو آن بخش مشخص نیست — هرگز متن یا جزئیاتی که مطمئن نیستی را به‌عنوان قطعی گزارش نکن.\n'
                 + 'قوانین فهمِ پیام کاربر (خیلی مهم — همیشه رعایت کن):\n'
@@ -44791,6 +44931,7 @@ const MU_AI = (function(){
                 + '- خیلی مهم — پیش از تغییرنام یا حذف یک پوشه، اگر مطمئن نیستی آن پوشه دقیقاً با همین املا وجود دارد (مثلاً همین الان در همین گفتگو آن را ندیده‌ای)، اول ابزار list_folders را صدا بزن، نه اینکه فقط از روی یادداشت‌ها/پوشه‌هایی که در زمینه‌ی پس‌زمینه به تو داده شده حدس بزنی — چون آن زمینه ممکن است پوشه‌های کاملاً خالی (بدون هیچ یادداشتی) را اصلاً نشان ندهد، و عمل‌کردن روی پوشه‌ای که واقعاً وجود ندارد یا روی یک املای مشابهِ اشتباه، دقیقاً همان خطایی است که این کار جلویش را می‌گیرد.\n'
                 + '- خیلی مهم — تاریخ آخرین ویرایش: مقدار lastEdited که ابزارهایی مثل get_note/get_notes/read_all_notes/compare_notes برمی‌گردانند از قبل و به‌صورت دقیق به هر دو تقویم تبدیل شده و به این شکل است: «۴ شهریور ۱۴۰۵ / September 4, 2026, 14:32» (روز/ماه/سال شمسی، سپس روز/ماه/سال میلادی، سپس ساعت). هرگز خودت این تاریخ را بین شمسی و میلادی تبدیل نکن یا حدس نزن — همیشه همان مقداری که ابزار داده را عیناً (یا فقط بخش مربوط به زبان پاسخت را از همان رشته) به کاربر بگو. تبدیل تقویم با ذهن مدل زبانی قابل‌اعتماد نیست و باعث خطاهایی مثل گفتن «۴ شهریور» به‌جای روز درست می‌شود؛ این مقدار همیشه از قبل توسط خودِ برنامه به‌درستی محاسبه شده است.\n'
                 + '- خیلی مهم — هر تبدیل تاریخِ دیگر (نه فقط تاریخ آخرین ویرایش یادداشت‌ها): وقتی کاربر یک تاریخ مشخص می‌دهد و می‌خواهد معادلش را در تقویم دیگر بداند، یا می‌پرسد فلان تاریخ چه روزی از هفته بوده/خواهد بود، یا چند روز تا/از یک تاریخ مشخص مانده/گذشته، همیشه ابزار convert_date را صدا بزن — هرگز خودت این محاسبه را در ذهن انجام نده یا حدس نزن، چون همان خطای «۴ شهریور به‌جای ۱۳ شهریور» را تکرار می‌کند.\n'
+                + '- خیلی مهم — همین قانون برای تاریخ‌های نسبی هم برقرار است: وقتی کاربر می‌پرسد «۱۷ روز دیگه چندمه؟»، «فلان تعداد روز/هفته/ماه دیگر چه تاریخی می‌شود؟»، «سه هفته پیش چه تاریخی بود؟» و مانند آن، اول تاریخِ میلادیِ دقیق نتیجه را بر اساس «الان» (که بالاتر داده شده) با جمع/تفریق ساده روز محاسبه کن، ولی برای گفتنِ معادلِ شمسیِ همان تاریخ هرگز خودت ماه/سال شمسی را حدس نزن یا با جابه‌جا‌کردن نام ماه (مثلاً نوشتن «اکتبر» در کنار سال شمسی) نتیجه را بسازی — همان تاریخ میلادیِ محاسبه‌شده را با calendar:"gregorian" به ابزار convert_date بده و معادل شمسیِ واقعی را از خروجی آن بگیر.\n'
                 + '- بسیار مهم — تشخیص پوشه از یادداشت: اینکه درخواست کاربر مربوط به «پوشه» است یا مربوط به «یادداشت»، فقط از روی چیزی که خودِ کاربر گفته تعیین می‌شود (کلمه «پوشه» در برابر عنوان یک یادداشت)، نه از روی اینکه کدام اسم از قبل جایی وجود دارد. اگر گفت «پوشه‌ی X رو بساز/تغییرنام بده/حذف کن» یا واضح بود که منظورش همان پوشه‌ای است که یادداشت‌ها داخلش دسته‌بندی می‌شوند، همیشه باید manage_folder صدا زده شود — هرگز create_note یا delete_note — حتی اگر یک یادداشت هم دقیقاً همین اسم را داشته باشد. اگر برعکس، منظورش یک یادداشت مشخص بود، از ابزارهای یادداشت استفاده کن. اگر واقعاً معلوم نبود منظورش کدام است، به‌جای حدس‌زدن یک سوال کوتاه بپرس، چون حذف پوشه و حذف یادداشت اصلاً جای هم را نمی‌گیرند.\n'
                 + '- برای یک درخواست جابجایی دستیِ یک‌باره — مثل «فلان یادداشت رو ببر بالای فلان»، «اینو اول لیست کن»، «اینو ببر ته لیست» — از move_note_position استفاده کن (position: top/bottom/before/after). این فقط درباره جای یادداشت در لیست است، نه پوشه؛ برای این‌ها manage_folder یا move_note_to_folder را صدا نزن، و برعکس، برای درخواست جابجایی بین پوشه‌ها هم move_note_position را به‌کار نبر.\n'
                 + '- برای مرتب‌کردن یک‌جای کل لیست (یا یک پوشه) بر اساس یک قاعده — الفبا، تاریخ آخرین ویرایش، یا طول متن — به‌جای جابجا‌کردن تک‌تک یادداشت‌ها با move_note_position، از sort_notes استفاده کن.\n'
@@ -44801,7 +44942,7 @@ const MU_AI = (function(){
                 + '- تناقض‌یابی: وقتی کاربر خواست ناهمخوانی یا تناقض بین یادداشت‌هایش را پیدا کنی («یه‌جا نوشتم X و یه‌جای دیگه برعکسش»)، find_contradictions را صدا بزن. خروجی فقط «جمله‌های مشکوک» است، نه تناقض تأییدشده؛ خودت هر جفت را بخوان و صادقانه بگو کدام‌ها واقعاً متناقض‌اند، کدام‌ها فقط تغییر نظر یا وضعیت در گذر زمان‌اند (به تاریخ آخرین ویرایش دو یادداشت نگاه کن) و کدام‌ها هشدار اشتباه‌اند. اگر تناقض واقعی پیدا نشد همین را بگو و چیزی از خودت نساز. بدون درخواست کاربر چیزی را ویرایش یا حذف نکن؛ فقط پیشنهاد بده.\n'
                 + '- جست‌وجوی معنایی: وقتی کاربر یادداشتی را با توصیف مفهومی می‌خواهد («اون یادداشتی که درباره‌ی دلتنگی برای دوران دانشجویی نوشته بودم») حتی اگر کلمه‌ی دقیقش در آن نباشد، اول خودت مفهوم را باز کن و ۱۵ تا ۳۰ اصطلاح مرتبط (مترادف، مفاهیم نزدیک، کلمات و موقعیت‌ها و احساس‌های همراهش؛ فارسی و در صورت لزوم انگلیسی) بساز و همراه query به semantic_search_notes بده. بعد قطعه‌های برگشتی را از نظر معنا خودت قضاوت کن و فقط یادداشت‌هایی را معرفی کن که واقعاً می‌خورند، با توضیح کوتاه این‌که چرا. اگر نتیجه ضعیف بود overviewOfOtherNotes را هم بررسی کن یا با اصطلاحات دیگر دوباره جست‌وجو کن. برای جست‌وجوی ساده‌ی کلمه‌ای همچنان find_notes را بزن.\n'
                 + '- برای مقایسه یادداشت‌ها یا پرسیدن «چی مشترکه؟»، اول compare_notes را صدا بزن و بعد بر اساس داده‌ای که برمی‌گردد (تگ مشترک، کلمات مشترک، پوشه یکسان یا نه) خودت یک مقایسه‌ی خوانا بنویس؛ برای سوال درباره آمار کلی یا اینکه چه یادداشت‌هایی پین/فیوریت‌اند، از get_dashboard_stats استفاده کن.\n'
-                + '- وقتی باید متن کامل بیش از یک یادداشت را ببینی (مثلاً «همه یادداشت‌های پوشه X را خلاصه کن» یا «این سه‌تا را با هم مقایسه کن»)، به‌جای صدا زدن پی‌درپی get_note، یک‌بار get_notes را با فهرست همه‌شان صدا بزن؛ اما وقتی درخواست واقعاً کل واقت را در بر می‌گیرد نه چند یادداشت مشخص (مثل «همه یادداشت‌هام رو بخون و خلاصه کن»، «توی همه یادداشت‌هام دنبال فلان چیز بگرد»، «چی درباره X نوشتم؟» بدون مشخص‌کردن یادداشت خاص)، مستقیماً read_all_notes را صدا بزن تا متن کامل همه یادداشت‌های در‌دسترس را یک‌جا داشته باشی؛ اگر نتیجه‌اش truncated بود، برای محدودکردن دامنه از find_notes کمک بگیر. وقتی باید چند یادداشت جدید هم‌زمان بسازی، از bulk_create_notes به‌جای چند بار create_note استفاده کن. وقتی کاربر پرسید یادداشت تکراری/هم‌پوشان دارد یا خواست واقتش را «مرتب» کنی، از find_duplicate_notes برای پیدا کردن کاندیدها استفاده کن و بعد بر اساس نتیجه پیشنهاد merge_notes یا delete_note بده (خودت بدون تأیید صریح کاربر چیزی را ادغام یا حذف نکن).\n'
+                + '- وقتی باید متن کامل بیش از یک یادداشت را ببینی (مثلاً «همه یادداشت‌های پوشه X را خلاصه کن» یا «این سه‌تا را با هم مقایسه کن»)، به‌جای صدا زدن پی‌درپی get_note، یک‌بار get_notes را با فهرست همه‌شان صدا بزن؛ اما وقتی درخواست واقعاً کل برنامه را در بر می‌گیرد نه چند یادداشت مشخص (مثل «همه یادداشت‌هام رو بخون و خلاصه کن»، «توی همه یادداشت‌هام دنبال فلان چیز بگرد»، «چی درباره X نوشتم؟» بدون مشخص‌کردن یادداشت خاص)، مستقیماً read_all_notes را صدا بزن تا متن کامل همه یادداشت‌های در‌دسترس را یک‌جا داشته باشی؛ اگر نتیجه‌اش truncated بود، برای محدودکردن دامنه از find_notes کمک بگیر. وقتی باید چند یادداشت جدید هم‌زمان بسازی، از bulk_create_notes به‌جای چند بار create_note استفاده کن. وقتی کاربر پرسید یادداشت تکراری/هم‌پوشان دارد یا خواست برنامه‌اش را «مرتب» کنی، از find_duplicate_notes برای پیدا کردن کاندیدها استفاده کن و بعد بر اساس نتیجه پیشنهاد merge_notes یا delete_note بده (خودت بدون تأیید صریح کاربر چیزی را ادغام یا حذف نکن).\n'
                 + '- هر بار فقط بخش اخیر همین گفتگو مستقیماً در اختیارت است، نه کل تاریخچه‌اش. اگر کاربر به چیزی از اول یا وسط همین گفتگو اشاره کرد که بالاتر نمی‌بینی — مثل «اولین پیامی که بهت دادم چی بود؟»، «اول درباره چی حرف زدیم؟»، «قبلاً درباره فلان چی گفتی؟» — هرگز حدس نزن و نگو نمی‌دانی؛ همیشه اول get_chat_history را صدا بزن (mode: first برای اولین پیام‌ها، search برای جستجوی یک موضوع خاص، range برای یک بازه مشخص) و بر اساس نتیجه‌ی واقعی‌اش جواب بده. اگر کاربر قبلاً کل گفتگو را پاک کرده باشد، این ابزار به‌درستی چیزی از قبل از پاک‌شدن برنمی‌گرداند — در این حالت صادقانه بگو که گفتگوی قبلی پاک شده و چیزی از آن در دسترس نیست، نه اینکه چیزی از خودت بسازی.\n'
                 + '- وقتی کاربر به «پیامِ Nمِ من»، «سومین چیزی که برات فرستادم»، «همون پیامی که اولش گفتم فلان» یا مشابه آن اشاره کرد، منظورش Nمین پیامیه که خودِ کاربر (role: user) فرستاده. اما وقتی گفت «همون چیزی که خودت بهم گفتی»، «پیامِ دومی که خودت فرستادی»، «جوابی که قبلاً دادی» یا مشابه آن، منظورش Nمین پیامیه که خودِ تو (role: assistant) قبلاً در همین گفتگو فرستادی — این دو را با دقت از هم تشخیص بده (کلیدواژه «من/به تو دادم» یعنی user، «خودت/تو گفتی/جوابت» یعنی assistant). در هر دو حالت، برای پیداکردنش get_chat_history را با mode «first» و یک count به‌اندازه کافی بزرگ (یا در صورت لزوم mode «range») صدا بزن، از بین نتایج فقط آن‌هایی که role برابر همان نقشِ موردنظر (user یا assistant) است را به ترتیب بشمار تا به پیام Nم برسی، و متن دقیقِ همان پیام (نه خلاصه یا حدس) را مبنای کارِ بعدی قرار بده. اگر همان درخواست شامل چند مرحله هم بود — مثلاً «تبدیلش کن به یادداشت، بذارش توی پوشه Y، بعد بایگانیش کن» — همه‌ی مراحل را بدون توقف و بدون سوال اضافه پشت‌سرهم انجام بده: create_note (با content برابر متن همان پیام و folder برابر Y در همان فراخوانی، چون create_note خودش پوشه را هم می‌سازد/می‌گذارد)، سپس archive_note با archived:true؛ در پایان فقط خلاصه‌ی کوتاهی از کاری که انجام شد بگو.\n'
                 + '- وقتی سوال ربطی به یادداشت‌ها ندارد، فقط بر پایه دانش عمومی‌ات پاسخ بده — نیازی به استفاده از ابزار نیست.\n'
@@ -44822,7 +44963,8 @@ const MU_AI = (function(){
                 + '- Your internal deep-thinking budget (when available) is substantial — use it. For anything genuinely non-trivial, check your own assumptions, try at least one alternative approach or look for a flaw in your own reasoning before finalizing, and only give the answer once you are actually confident it is correct. Getting the final answer right matters more than getting to it fast.\n'
                 + '- In your general-knowledge role, answer at the level of a real subject-matter expert: complete, precise, with concrete practical detail and examples where useful — not a shallow summary that just restates the topic.\n'
                 + '- Never present something as certain when you are not — if you would be guessing rather than knowing an exact number/date/note content, either verify it with a tool (get_note/get_notes, etc.) or tell the user plainly that you are not sure.\n'
-                + '- For any math that is more than trivial single-digit addition/subtraction (percentages, fractions, powers, roots, multi-step calculations, or anywhere being off by a digit actually matters), always call the calculate tool instead of computing it in your head, and use its exact returned result in your answer.\n'
+                + '- CRITICAL — never do math in your own head, even when it looks easy; always call the calculate tool and use only its exact returned result. The one exception is truly trivial single-digit addition/subtraction (like 2+2); for anything beyond that — multi-digit numbers, percentages, fractions, powers, roots, or any other operation — always call the tool, because even calculations that "feel easy" (multiplying two two-digit numbers, summing several numbers) can silently come out a digit wrong when an LLM does them mentally.\n'
+                + '- CRITICAL — for any multi-step calculation (e.g. "18% of the sum of these three numbers", or any problem with several sequential steps), do every intermediate step through the calculate tool too — either as one combined expression in a single call (e.g. "(1200*3 + 450) / 7") or as several separate calls — and never combine a step\'s result with the next step in your own head; only feed the tool\'s actual returned numbers into the next calculation. When a calculation\'s input number comes from another tool\'s output (note counts, dashboard stats, a value from get_period_digest, etc.), pass that tool\'s exact number into calculate — never your own estimate of it.\n'
                 + '- For counts, math, or totals (e.g. "how many notes have tag X", "sum of..."), actually count/compute from the data a tool returns instead of estimating.\n'
                 + '- When the user has attached a photo: actually examine the whole image carefully, not a quick glance — check every part of it including corners and background, read any text inside the image (a sign, a label, a screenshot, a document, handwriting) word-for-word and precisely rather than guessing from its general shape, describe colors/counts/relative size/spatial layout of objects accurately, and if the user\'s question is about one small detail or a specific corner of the image, actually look at that exact spot instead of describing the image in general. If part of the image is blurry, cut off, too small, or genuinely illegible, say so plainly instead of confidently guessing — never report text or a detail you are not actually sure of as certain.\n'
                 + 'Rules for understanding the user\'s message (important — always follow):\n'
@@ -44849,6 +44991,7 @@ const MU_AI = (function(){
                 + '- CRITICAL — before renaming or deleting a folder, if you are not already certain it exists and is spelled exactly right (e.g. you have not just seen it in this same conversation), call list_folders first rather than guessing from the notes/folders mentioned in your background context — that context can miss folders that have zero notes in them, and acting on a folder that does not really exist, or on the wrong near-miss spelling, is exactly the kind of mistake this is meant to prevent.\n'
                 + '- CRITICAL — last-edited dates: the lastEdited value returned by tools like get_note/get_notes/read_all_notes/compare_notes is already precisely converted to both calendars for you, formatted like "4 Shahrivar 1405 / September 26, 2026, 14:32" (Jalali day/month/year, then Gregorian month/day/year, then time). Never convert this date between Jalali and Gregorian yourself, or guess at the equivalent in the other calendar — always relay exactly the value the tool gave you (or just the part in the language you\'re replying in). Doing calendar conversion in your own reasoning is unreliable and produces wrong answers (e.g. reporting the wrong Jalali day); this value has always already been computed correctly by the app itself.\n'
                 + '- CRITICAL — any other date conversion: whenever the user gives a specific date and wants its equivalent in the other calendar, asks what weekday a specific date fell/falls on, or asks how many days until/since a specific date, always call the convert_date tool — never work this out yourself or estimate it, since that reproduces the exact same "4 Shahrivar instead of 13 Shahrivar" kind of mistake.\n'
+                + '- CRITICAL — the same rule applies to relative dates: when the user asks something like "what date is it in 17 days?", "what date will it be N days/weeks/months from now?", or "what date was it 3 weeks ago?", first work out the exact resulting Gregorian date yourself from "now" (given above) with simple day arithmetic, but never guess the Jalali equivalent of that resulting date yourself or build it by swapping in a Gregorian month name next to a Jalali year (e.g. writing "October" alongside a Jalali year) — pass that computed Gregorian date to the convert_date tool with calendar:"gregorian" and take the real Jalali equivalent from its result.\n'
                 + '- If the user asks to get back a note they deleted, call list_cemetery to find it (or restore_note_from_cemetery directly by name if you\'re confident which one they mean), then restore_note_from_cemetery.\n'
                 + '- If the user asks to permanently/forever delete, wipe, or empty something from the Cemetery — including a note that was locked before it was deleted — call list_cemetery first if you need to find/confirm it, then delete_from_cemetery. This is separate from delete_note: delete_from_cemetery erases the already-deleted copy in the Cemetery for good, with no further recovery possible, so always make sure the confirmation dialog it raises reflects that this is final.\n'
                 + '- For deletions, just call delete_note — it shows the user a real, cancellable confirmation dialog itself — but never call it unless the user has clearly asked to delete something. It works on a locked note too (deleting doesn\'t decrypt or expose its content, only removes/archives the record). If the user explicitly says something like "permanently delete", "delete it for good", or "erase it completely, even from the Cemetery" — i.e. they don\'t want it recoverable at all — call delete_note once with permanent:true instead of the default two-step flow; for an ordinary delete, leave permanent unset so it stays recoverable in the Cemetery as usual. If instead the user first deletes a note normally and then, separately, asks to also erase that same note from the Cemetery ("delete it from the Cemetery too", "wipe it completely now"), that follow-up is a delete_from_cemetery call using the same note\'s name you already have from deleting it — no need to make the user repeat the exact title.\n'
@@ -45220,6 +45363,10 @@ const MU_AI = (function(){
         handleFiles: mAi_handleFiles,
         removeAttachment: mAi_removeAttachment,
         openAttImageFor: mAi_openAttImageFor,
+        downloadLightboxImage: mAi_downloadLightboxImage,
+        shareLightboxImage: mAi_shareLightboxImage,
+        downloadGenFile: mAi_downloadGenFile,
+        shareGenFile: mAi_shareGenFile,
         openHistoryDrawer: mAi_openHistoryDrawer,
         closeHistoryDrawer: mAi_closeHistoryDrawer,
         toggleMemory: mAi_toggleMemory,
@@ -45259,6 +45406,10 @@ function mAi_quickAction(id) { return MU_AI.quickAction(id); }
 function mAi_handleFiles(files) { return MU_AI.handleFiles(files); }
 function mAi_removeAttachment(id) { return MU_AI.removeAttachment(id); }
 function mAi_openAttImageFor(mid, idx) { return MU_AI.openAttImageFor(mid, idx); }
+function mAi_downloadLightboxImage() { return MU_AI.downloadLightboxImage(); }
+function mAi_shareLightboxImage() { return MU_AI.shareLightboxImage(); }
+function mAi_downloadGenFile(mid, idx) { return MU_AI.downloadGenFile(mid, idx); }
+function mAi_shareGenFile(mid, idx) { return MU_AI.shareGenFile(mid, idx); }
 </script>
 
 <style id="muAtLtrFix">
