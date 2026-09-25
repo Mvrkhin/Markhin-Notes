@@ -19546,6 +19546,28 @@ function mu_joinApiUrl(baseUrl, path){
     return base + '/' + pathNoSlash;
 }
 
+// Best-effort "is this model free" detector for the "Fetch models" list,
+// so free models can be surfaced first instead of buried alphabetically
+// among hundreds of paid ones. Two independent signals, since no single
+// catalog format is universal:
+//  1) OpenRouter's own naming convention — free variants are suffixed
+//     ":free" right on the model id (e.g. "meta-llama/llama-3.3-70b-
+//     instruct:free"). This also works even if the raw list entry was
+//     reduced to a bare string somewhere upstream.
+//  2) A per-model "pricing" object (OpenRouter and some other catalogs
+//     expose this) where both the prompt and completion price are "0".
+// Anything else is treated as not-free rather than guessed at — a false
+// "free" label would be far more misleading than simply not detecting one.
+function mu_isFreeModelEntry(id, raw){
+    if(/:free\b/i.test(String(id||''))) return true;
+    if(raw && typeof raw === 'object'){
+        const pr = raw.pricing;
+        if(pr && (parseFloat(pr.prompt) === 0) && (parseFloat(pr.completion) === 0)) return true;
+        if(raw.free === true) return true;
+    }
+    return false;
+}
+
 // Turns a failed response into a short, actually-readable message instead
 // of a raw (often huge, sometimes HTML) response body. Most providers send
 // JSON like {"error":{"message":"..."}} (OpenAI/Groq/Together/DeepSeek
@@ -19883,6 +19905,18 @@ function mu_extractOpenAiText(data){
             || (data && data.message && typeof data.message.content === 'string' && data.message.content)
             || (data && typeof data.response === 'string' && data.response)
             || '';
+    }
+    // Fallback for reasoning/"thinking" models (DeepSeek R1, QwQ, and other
+    // reasoning models routed through OpenRouter and similar OpenAI-compatible
+    // providers): when the model spends its whole token budget on hidden
+    // reasoning, `message.content` comes back empty while the actual text
+    // sits in `message.reasoning` / `message.reasoning_content` instead —
+    // previously this made the app treat a real (if unintended) reply as a
+    // totally empty response and burn 3 retries before giving up. Only used
+    // when content itself is truly empty, so normal replies are unaffected.
+    if(!text){
+        const reasoningText = msg.reasoning_content || msg.reasoning || (choice && choice.reasoning) || '';
+        if(typeof reasoningText === 'string' && reasoningText) text = reasoningText;
     }
     return String(text || '');
 }
@@ -20773,6 +20807,8 @@ const MarkhinAI = window.MarkhinAI = {
     // it works before the person has even hit Save. Anthropic exposes
     // GET /v1/models; every OpenAI-compatible provider (built-in or
     // custom) exposes GET {baseUrl}/models — both used read-only here.
+    // Resolves to an array of {id, free} objects (see mu_isFreeModelEntry)
+    // rather than plain strings, so the UI can list free models first.
     async fetchModels(fields){
         const fa = currentLang==='fa';
         const apiKey = mu_sanitizeApiKeyValue(fields.apiKey||'').value;
@@ -20792,7 +20828,10 @@ const MarkhinAI = window.MarkhinAI = {
                 });
                 if(!res.ok){ const tx = await res.text().catch(()=>''); throw new Error('Anthropic ' + mu_extractApiErrorMessage(res.status, tx)); }
                 const data = await res.json().catch(()=>({}));
-                return (data.data||[]).map(m=>m.id).filter(Boolean);
+                // Anthropic's catalog has no free tier via the API, so every
+                // entry is free:false — kept as {id, free} objects anyway so
+                // the caller can treat every provider's result the same way.
+                return (data.data||[]).map(m=>({ id: m.id, free: false })).filter(m=>m.id);
             }
             if(!fields.baseUrl) throw new Error(fa ? 'اول Base URL را وارد کن.' : 'Enter a Base URL first.');
             const url = mu_joinApiUrl(fields.baseUrl, '/models');
@@ -20800,7 +20839,15 @@ const MarkhinAI = window.MarkhinAI = {
             if(!res.ok){ const tx = await res.text().catch(()=>''); throw new Error(mu_extractApiErrorMessage(res.status, tx)); }
             const data = await res.json().catch(()=>({}));
             const list = Array.isArray(data.data) ? data.data : (Array.isArray(data.models) ? data.models : []);
-            return list.map(m=> (typeof m === 'string' ? m : (m.id || m.name || ''))).filter(Boolean);
+            // Each entry keeps its raw object (not just the id string) just
+            // long enough to check for a "pricing" field (see
+            // mu_isFreeModelEntry) — providers like OpenRouter expose one
+            // per model, and that's the only place the "free" signal lives.
+            return list.map(m=>{
+                const raw = (typeof m === 'string') ? null : m;
+                const id = typeof m === 'string' ? m : (m.id || m.name || '');
+                return id ? { id, free: mu_isFreeModelEntry(id, raw) } : null;
+            }).filter(Boolean);
         } catch(err){
             if(err && err.name === 'AbortError') throw new Error(fa ? 'درخواست فهرست مدل‌ها بیش از حد طول کشید.' : 'Fetching the model list took too long.');
             if(/Failed to fetch|NetworkError|Load failed|ERR_/i.test(String((err&&err.message)||err))){
@@ -21366,15 +21413,27 @@ window.mu_fetchAiModelsList = async function(){
         const models = await MarkhinAI.fetchModels({ format, apiKey, baseUrl });
         if(!models.length){ box.innerHTML = fa ? 'چیزی پیدا نشد.' : 'Nothing found.'; return; }
         box.innerHTML = '';
-        models.slice(0,200).forEach(m=>{
+        // Free models (detected via mu_isFreeModelEntry) are shown first,
+        // marked with a 🆓 badge, so a person doesn't have to scroll/hunt
+        // through a huge paid catalog to find them. Array.sort is a stable
+        // sort in every current browser, so within each group (free / not
+        // free) the provider's own original ordering is preserved.
+        const sorted = models.slice().sort((a,b)=> (a.free?0:1) - (b.free?0:1));
+        // Upgrade: was capped at 200 — providers like OpenRouter now list
+        // 300+ models, so the old cap silently hid the rest of the list
+        // from the picker (the person could still type a hidden model's
+        // name manually, but had no way to discover it via "Fetch models").
+        // Raised well above any current provider's catalog size.
+        sorted.slice(0,1000).forEach(m=>{
             const b = document.createElement('button');
             b.type = 'button';
             b.className = 'btn-main';
             b.style.cssText = 'text-align:'+(fa?'right':'left')+';font-size:11px;padding:5px 8px';
-            b.textContent = m;
+            b.textContent = (m.free ? '🆓 ' : '') + m.id;
+            if(m.free) b.title = fa ? 'مدل رایگان' : 'Free model';
             b.onclick = function(){
                 const modelEl = document.getElementById('muAiModel');
-                if(modelEl) modelEl.value = m;
+                if(modelEl) modelEl.value = m.id;
                 box.style.display = 'none';
             };
             box.appendChild(b);
