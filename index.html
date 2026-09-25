@@ -11430,6 +11430,7 @@ window.mu_syncHtmlBg = function(){
                            class="mc-title-input"
                            value="${escapeHtml(item.name || '')}"
                            placeholder="${escapeHtml(t.titleFieldPlaceholder || t.rename)}"
+                           maxlength="120"
                            ${item.isDecoy ? 'disabled' : ''}
                            oninput="mcLiveTitle('${item.id}', this.value)"
                            onchange="mcCommitTitle('${item.id}')"
@@ -11445,7 +11446,7 @@ window.mu_syncHtmlBg = function(){
                          ondrop="dropImage(event, '${item.id}')">${isHidden ? generateMask() : contentHtml}</div>
 
                     <div style="font-size: 10px; color: rgba(255,255,255,0.4); text-align: left; margin-top: 8px; direction: ltr;">
-                        <strong>Last Edited:</strong> ${lastEditedText}
+                        <strong>Last Edited:</strong> ${escapeHtml(lastEditedText)}
                     </div>
 
                     <div id="preview-${item.id}" class="preview-box"></div>
@@ -12648,9 +12649,14 @@ window.mu_syncHtmlBg = function(){
                 if (modalEl) modalEl.addEventListener('click', outsideClick, true);
                 const defaultValue = opts.defaultValue || '';
                 const isPassword = !multiline && opts.type === 'password';
+                // Single-line max length is configurable per-call (opts.maxLength) so
+                // callers that create/rename a note or folder can cap it at 120 chars
+                // while other single-line uses of this same dialog (passwords, hints,
+                // link URLs) keep the old, more generous 512-char limit.
+                const singleLineMaxLength = Number(opts.maxLength) > 0 ? Number(opts.maxLength) : 512;
                 const inputHtml = multiline
                     ? `<textarea id="${uid}_input" class="markhin-filename-input" style="min-height:110px;resize:vertical" placeholder="${escapeHtml(opts.placeholder || '')}" maxlength="8000" spellcheck="false">${escapeHtml(defaultValue)}</textarea>`
-                    : `<input type="${escapeHtml(opts.type || 'text')}" id="${uid}_input" class="markhin-filename-input" placeholder="${escapeHtml(opts.placeholder || '')}" value="${escapeHtml(defaultValue)}" maxlength="512" autocomplete="off" spellcheck="false">`;
+                    : `<input type="${escapeHtml(opts.type || 'text')}" id="${uid}_input" class="markhin-filename-input" placeholder="${escapeHtml(opts.placeholder || '')}" value="${escapeHtml(defaultValue)}" maxlength="${singleLineMaxLength}" autocomplete="off" spellcheck="false">`;
                 showAdvanced(`
                     <div class="advanced-head image-export-picker-head">
                         <div>
@@ -14894,7 +14900,8 @@ window.mu_syncHtmlBg = function(){
             const name = await promptStyledText({
                 title: fa ? '📝 یادداشت جدید' : '📝 New note',
                 placeholder: t.promptNewCategory,
-                okText: fa ? '➕ افزودن' : '➕ Add'
+                okText: fa ? '➕ افزودن' : '➕ Add',
+                maxLength: 120
             });
             if (name && name.trim() !== '') {
                 const newCategory = {
@@ -14938,7 +14945,8 @@ window.mu_syncHtmlBg = function(){
             const name = await promptStyledText({
                 title: fa ? '📁 پوشه جدید' : '📁 New folder',
                 placeholder: t.promptNewFolder,
-                okText: fa ? '➕ افزودن' : '➕ Add'
+                okText: fa ? '➕ افزودن' : '➕ Add',
+                maxLength: 120
             });
             if (name && name.trim() !== '') {
                 const cleanName = name.trim();
@@ -16975,10 +16983,10 @@ window.renderFolders=function(){
 window.addNewFolder=async function(){
  const t=i18n[currentLang]; const fa=currentLang==='fa';
  const parent=folders.filter(f=>f!==DEFAULT_FOLDER).length
-   ? await promptStyledText({title:fa?'📁 پوشه والد':'📁 Parent folder', placeholder:fa?'پوشه والد را وارد کن (خالی = ریشه):':'Parent folder (blank = root):', okText:fa?'ادامه':'Continue'})
+   ? await promptStyledText({title:fa?'📁 پوشه والد':'📁 Parent folder', placeholder:fa?'پوشه والد را وارد کن (خالی = ریشه):':'Parent folder (blank = root):', okText:fa?'ادامه':'Continue', maxLength:120})
    : '';
  if(parent===null)return;
- const name=await promptStyledText({title:fa?'📁 پوشه جدید':'📁 New folder', placeholder:t.promptNewFolder, okText:fa?'➕ افزودن':'➕ Add'});
+ const name=await promptStyledText({title:fa?'📁 پوشه جدید':'📁 New folder', placeholder:t.promptNewFolder, okText:fa?'➕ افزودن':'➕ Add', maxLength:120});
  if(!name||!name.trim())return; const clean=(parent&&parent.trim()?parent.trim().replace(/^\/+|\/+$/g,'')+'/':'')+name.trim().replace(/^\/+|\/+$/g,'');
  if(folders.some(f=>normalizeText(f)===normalizeText(clean))){showToast(currentLang==='fa'?'این پوشه از قبل وجود دارد.':'That folder already exists.');return} folders.push(clean);saveFoldersToLocalStorage();renderFolders();
  // Same idea as new-note creation: scroll the just-added folder tab into view
@@ -21952,7 +21960,7 @@ window.attachWrapperEvents = function(categoryId){
                     <div class="mg-card-body">
                         <span class="mg-card-title">TRAP DEVIL</span>
                         <span class="mg-card-title-fa" id="mgCardTrapDevilTitleFa">فرار از تله‌های شیطون</span>
-                        <span class="mg-card-desc" id="mgCardTrapDevilDesc">یه پلتفرمر بی‌رحم و پر از تله‌های کثیف: کف‌های تقلبی، تیغ‌های چرخون، فلش‌های ناغافل، سکوهای ناپدید‌شونده و حتی یه تیکه زمین که از پشت سرت کنده می‌شه و دنبالت می‌افته! به هیچی اعتماد نکن، شیطون همیشه یه غافلگیری تازه برات چیده! 😈</span>
+                        <span class="mg-card-desc" id="mgCardTrapDevilDesc">یه پلتفرمر بی‌رحم و پر از تله‌های کثیف: کف‌های تقلبی، تیغ‌های چرخون، فلش‌های ناغافل، سکوهای ناپدید‌شونده. بدون چک‌پوینت، بدون رحم 😈</span>
                         <span class="mg-card-play" id="mgCardTrapDevilPlay">😈 شروع فرار</span>
                     </div>
                   </div>
@@ -31308,14 +31316,14 @@ STR.fa.levels = [
     { lv: 'مرحله ۲', name: 'آرامگاه یخ‌بندان', sub: 'کلید ارواح رو پیدا کن — بدون چک‌پوینت',
       how: 'روی یخ لیز می‌خوری، تله‌ها زنده‌ن و چهار آیتم تنها دوستاتن: 🪶 پر بال، 🏮 فانوس حقیقت، ⏳ ساعت شنی و 🛡️ سپر. کلید ارواح رو بیار تا مهر دروازه باز شه.' },
     { lv: 'مرحله ۳', name: 'برج ابسیدین', sub: 'از دل تاریکی بالا برو، از قله برگرد — بدون چک‌پوینت',
-      how: 'مسیر این‌بار یه خط راست نیست: باید بالا بری، روی لبه‌های بلند جلو بری و بعد دوباره به عمق برگردی. پرتال‌های دروغین، پل‌های نامرئی و یه گرز چرخان منتظرتن. همون پنج دوست همیشگی همراهتن: 🪶 پر بال، 🛡️ سپر ارواح، 🏮 فانوس حقیقت، ⏳ ساعت شنی و در انتها 🗝️ کلید ارواح — این‌بار حتی یه نسخه‌ی یدکی از هر کدوم هم جایی قایم شده.' }
+      how: 'مسیر این‌بار یه خط راست نیست: باید بالا بری، روی لبه‌های بلند جلو بری و بعد دوباره به عمق برگردی. پرتال‌های دروغین، پل‌های نامرئی و یه گرز چرخان منتظرتن.' }
 ];
 STR.en.levels = [
     { lv: 'LEVEL 1', name: 'The Cinder Gate', sub: 'No checkpoints — one run to the gate', how: STR.en.how },
     { lv: 'LEVEL 2', name: 'The Glacial Sepulcher', sub: 'Find the Soul Key — no checkpoints',
       how: 'The ice is slippery, the traps are alive, and four items are your only friends: 🪶 Feather, 🏮 Lantern of Truth, ⏳ Hourglass and 🛡️ Shield. Bring the Soul Key to break the seal.' },
     { lv: 'LEVEL 3', name: 'The Obsidian Spire', sub: 'Climb out of the dark, then back down from the peak — no checkpoints',
-      how: "The path is no longer a straight line: you'll climb, run along high ledges, then drop back into the depths. Lying portals, an invisible bridge and a spinning mace are all waiting. The same five friends are with you: 🪶 Feather, 🛡️ Soul Shield, 🏮 Lantern of Truth, ⏳ Hourglass and, at the end, 🗝️ the Soul Key — this time a spare of every single one is hidden somewhere too." }
+      how: "The path is no longer a straight line: you'll climb, run along high ledges, then drop back into the depths. Lying portals, an invisible bridge and a spinning mace are waiting." }
 ];
 STR.fa.nextLevel = 'مرحله‌ی بعد'; STR.en.nextLevel = 'Next level';
 STR.fa.levelWord = 'مرحله'; STR.en.levelWord = 'Level';
@@ -35295,8 +35303,8 @@ return api;
         if (cardTitleFa) cardTitleFa.style.display = fa2 ? '' : 'none';
         const cardDesc = document.getElementById('mgCardTrapDevilDesc');
         if (cardDesc) cardDesc.textContent = fa2
-            ? 'یه پلتفرمر بی‌رحم پر از تله‌ی کثیف: کف‌های تقلبی، اره‌های چرخون، تیرهای ناگهانی، سکوهای غیب‌شونده و یه تیکه زمین که از پشت سرت کنده می‌شه و دنبالت می‌افته. بدون چک‌پوینت، بدون رحم — حالا با مرحله‌ی ۲ یخ‌زده و آیتم‌های قابل‌استفاده 😈'
-            : 'A ruthless platformer full of dirty tricks: fake floors, spinning saws, sneak-attack arrows, vanishing platforms, and a slab of ground that tears loose and hunts you down. No checkpoints, no mercy — now with a frozen Level 2 and usable items 😈';
+            ? 'یه پلتفرمر بی‌رحم پر از تله‌ی کثیف: کف‌های تقلبی، اره‌های چرخون، تیرهای ناگهانی، سکوهای غیب‌شونده. بدون چک‌پوینت، بدون رحم 😈'
+            : 'A ruthless platformer full of dirty tricks: fake floors, spinning saws, sneak-attack arrows, vanishing platforms. No checkpoints, no mercy 😈';
         const cardPlay = document.getElementById('mgCardTrapDevilPlay');
         if (cardPlay) cardPlay.textContent = fa2 ? '😈 شروع فرار' : '😈 Start Running';
         try { window.TrapDevil.applyLang(); } catch(_){}
@@ -39591,8 +39599,11 @@ const MU_AI = (function(){
             active.history = mAiHistory.slice(-MAI_HISTORY_STORE_CAP);
             active.updatedAt = Date.now();
             if(!active.title){
-                const firstUser = mAiHistory.find(function(m){ return m.role === 'user' && m.content; });
-                if(firstUser) active.title = String(firstUser.content).slice(0, 40);
+                const firstUser = mAiHistory.find(function(m){ return m.role === 'user' && mAi_hasSnippetContent(m); });
+                if(firstUser){
+                    const fa = currentLang === 'fa';
+                    active.title = mAi_plainSnippet(firstUser.content, 40) || mAi_attachLabel(firstUser, fa);
+                }
             }
         }
         const payload = JSON.stringify({ sessions: mAiSessions, activeId: mAiActiveSessionId });
@@ -39783,6 +39794,44 @@ const MU_AI = (function(){
     function mAiPreviewOf(text){
         const s = String(text == null ? '' : text).replace(/\s+/g, ' ').trim();
         return s.length > 120 ? s.slice(0, 120) + '…' : s;
+    }
+
+    // Plain-text, markdown-free snippet of a message — used for the chat
+    // history drawer's auto-generated title and last-message preview (see
+    // mAiSave() and mAi_renderHistoryList() below), so a message that
+    // starts with "**فلان**" or "# تیتر" doesn't leak raw asterisks/hashes
+    // into the history list. Unlike mAiPreviewOf() above (used inside the
+    // live chat, where the raw text is fine), this also strips the
+    // lightweight markdown mAiFormat() renders in bubbles, and always
+    // marks a real cut with an ellipsis so it's clear the text continues.
+    function mAi_plainSnippet(text, maxLen){
+        let s = String(text == null ? '' : text);
+        s = s.replace(/```[\s\S]*?```/g, ' ');                   // fenced code blocks
+        s = s.replace(/`([^`]+)`/g, '$1');                        // inline code
+        s = s.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');           // images
+        s = s.replace(/\[([^\]]+)\]\([^)]*\)/g, '$1');            // links
+        s = s.replace(/^\s{0,3}#{1,6}\s+/gm, '');                 // headings
+        s = s.replace(/^\s{0,3}>\s?/gm, '');                      // blockquotes
+        s = s.replace(/^\s*[-*+]\s+/gm, '');                      // list bullets
+        s = s.replace(/(\*\*\*|\*\*|\*|__|_)([^*_]+)\1/g, '$2');  // bold/italic
+        s = s.replace(/\s+/g, ' ').trim();
+        if(!s) return '';
+        return s.length > maxLen ? s.slice(0, maxLen).trim() + '…' : s;
+    }
+    // Fallback label for a message with no (or no longer any) text but
+    // that carries an image/file attachment, so the history list never
+    // shows a blank title/preview for e.g. a photo sent with no caption.
+    function mAi_attachLabel(m, fa){
+        if(m && Array.isArray(m.images) && m.images.length) return fa ? '🖼️ عکس' : '🖼️ Photo';
+        if(m && Array.isArray(m.files) && m.files.length) return fa ? '📎 فایل' : '📎 File';
+        return '';
+    }
+    // A message counts as real, title/preview-worthy content when it has
+    // actual text OR an attachment — used instead of the old bare
+    // "m.content" truthiness check, which skipped image/file-only
+    // messages entirely.
+    function mAi_hasSnippetContent(m){
+        return !!(m && (m.content || (m.images && m.images.length) || (m.files && m.files.length)));
     }
 
     function mAiRenderReplyBar(){
@@ -40297,11 +40346,20 @@ const MU_AI = (function(){
             const hist = s.history || [];
             let title = s.title;
             if(!title){
-                const firstUser = hist.find(function(m){ return m.role === 'user' && m.content; });
-                title = firstUser ? String(firstUser.content).slice(0, 40) : (fa ? 'گفتگوی جدید' : 'New chat');
+                const firstUser = hist.find(function(m){ return m.role === 'user' && mAi_hasSnippetContent(m); });
+                title = firstUser ? (mAi_plainSnippet(firstUser.content, 40) || mAi_attachLabel(firstUser, fa)) : '';
+                if(!title) title = fa ? 'گفتگوی جدید' : 'New chat';
             }
-            const lastMsg = hist.length ? hist[hist.length - 1] : null;
-            const preview = lastMsg ? String(lastMsg.content || '').replace(/\s+/g, ' ').slice(0, 50) : (fa ? 'بدون پیام' : 'No messages yet');
+            // The preview should reflect the actual last exchange, not an
+            // internal app notice (locked-note/truncation/budget warnings
+            // — see markhinAiChat_send, all pushed with synthetic:true).
+            // Those are meant to be seen only inline in that one chat, not
+            // to stand in for "what this conversation was about" here, so
+            // walk backwards past them to the real last message.
+            let lastMsg = null;
+            for(let i = hist.length - 1; i >= 0; i--){ if(!hist[i].synthetic){ lastMsg = hist[i]; break; } }
+            let preview = lastMsg ? (mAi_plainSnippet(lastMsg.content, 50) || mAi_attachLabel(lastMsg, fa)) : '';
+            if(!preview) preview = fa ? 'بدون پیام' : 'No messages yet';
             const dateStr = s.updatedAt ? new Date(s.updatedAt).toLocaleDateString(fa ? 'fa-IR' : 'en-US') : '';
             return '<div class="mAi-history-item' + (isActive ? ' mAi-history-item-active' : '') + '" onclick="mAi_switchSession(\'' + s.id + '\')">' +
                 '<div class="mAi-history-item-main">' +
