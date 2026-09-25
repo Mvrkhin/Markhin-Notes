@@ -43282,9 +43282,14 @@ const MU_AI = (function(){
             filename = 'markhin-ai-image-' + Date.now() + '.' + ext;
         }
         try {
-            const blob = await mAi_dataUrlToBlob(cur.dataUrl);
-            const file = new File([blob], filename, { type: mime });
-            if(navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))){
+            // Synchronous on purpose — see mAi_dataUrlToBlobSync's comment.
+            // An awaited step here (the old fetch()-based decode) was
+            // consuming the click's user-gesture window before
+            // navigator.share() ever ran, which is why Share silently
+            // failed inside Telegram's WebView while working fine in Chrome.
+            const blob = mAi_dataUrlToBlobSync(cur.dataUrl);
+            const file = blob && new File([blob], filename, { type: mime });
+            if(file && navigator.share && (!navigator.canShare || navigator.canShare({ files: [file] }))){
                 // Bug fix: some in-app WebViews (Telegram Android especially)
                 // expose navigator.share but the call just hangs forever
                 // instead of resolving OR rejecting when file-sharing isn't
@@ -43881,6 +43886,29 @@ const MU_AI = (function(){
     async function mAi_dataUrlToBlob(dataUrl){
         const resp = await fetch(dataUrl);
         return resp.blob();
+    }
+
+    // Synchronous counterpart to mAi_dataUrlToBlob() above, needed specifically
+    // for the share button (see mAi_shareLightboxImage). navigator.share()
+    // only works while the click that triggered it is still a "fresh" user
+    // gesture — browsers/WebViews expire that window the moment an await
+    // crosses a task boundary. fetch(dataUrl) above does exactly that (it's
+    // a real (if instant) async round trip), which is harmless for plain
+    // downloads but was silently costing the share button its gesture inside
+    // Telegram's stricter in-app WebView: navigator.share() would reject
+    // immediately (desktop Chrome tends to be lenient enough not to notice).
+    // Decoding the base64 payload by hand here keeps everything synchronous,
+    // so by the time navigator.share() is called no task boundary has been
+    // crossed and the gesture is still valid.
+    function mAi_dataUrlToBlobSync(dataUrl){
+        const match = /^data:([^;]+);base64,(.*)$/.exec(dataUrl);
+        if(!match) return null;
+        const mime = match[1];
+        const binary = atob(match[2]);
+        const len = binary.length;
+        const bytes = new Uint8Array(len);
+        for(let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+        return new Blob([bytes], { type: mime });
     }
 
     /* Real image EDITING (as opposed to generation from scratch): takes one
