@@ -14466,6 +14466,16 @@ window.mu_syncHtmlBg = function(){
             //      small the file is. It's kept only as a fallback for when share() is
             //      unavailable/rejected, not tried first anymore.
             if (IS_TELEGRAM) {
+                // Bug fix ("Download opens the share sheet instead of downloading"):
+                // this Method 0 share attempt used to run unconditionally, which is
+                // fine for a generic "get this saved somehow" call but wrong for a
+                // caller that specifically means "Download" (never "Share") — such a
+                // caller has no way to opt out, so the Download button could itself
+                // pop the OS share sheet. options.noShare lets a caller (see
+                // mAi_downloadLightboxImage) skip every share()-based method in this
+                // function and go straight to the genuine save paths (system-browser
+                // bridge, manual card, etc.), so Download can never open a share sheet.
+                if (!(options && options.noShare)) {
                 try {
                     if (navigator.share && typeof File !== 'undefined') {
                         const file = new File([blob], safeName, {type: mime || blob.type || 'application/octet-stream'});
@@ -14486,6 +14496,7 @@ window.mu_syncHtmlBg = function(){
                     if (e?.name === 'AbortError') return 'cancelled';
                     console.warn('Telegram share attempt failed, trying system-browser bridge…', e);
                 }
+                }
                 try {
                     if (await tgOpenInSystemBrowser(blob, safeName, mime || blob.type)) {
                         showToast(currentLang === 'fa'
@@ -14503,6 +14514,9 @@ window.mu_syncHtmlBg = function(){
                 // BEFORE the plain anchor click — otherwise Method 1 below can "succeed"
                 // (no exception) while nothing was actually saved, and we'd wrongly stop
                 // there instead of trying something that really works.
+                // options.noShare (see the IS_TELEGRAM branch's comment above) skips the
+                // share attempt here too, for the same "Download must never share" reason.
+                if (!(options && options.noShare)) {
                 try {
                     if (navigator.share && typeof File !== 'undefined') {
                         const file = new File([blob], safeName, {type: mime || blob.type || 'application/octet-stream'});
@@ -14514,6 +14528,7 @@ window.mu_syncHtmlBg = function(){
                         }
                     }
                 } catch (e) { if (e?.name === 'AbortError') return 'cancelled'; console.warn('In-app browser share attempt failed, trying new-tab…', e); }
+                }
                 try {
                     const openUrl = URL.createObjectURL(blob);
                     const w = window.open(openUrl, '_blank', 'noopener');
@@ -14578,6 +14593,12 @@ window.mu_syncHtmlBg = function(){
 
             // Method 3: native OS share/save sheet. Especially useful on Android when
             // the browser blocks automatic downloads from local HTML files.
+            // Bug fix ("Download opens the share sheet in Chrome"): this is the method
+            // that was popping a share sheet from a plain "Download" tap whenever
+            // Methods 1/2 above didn't pan out on that device — options.noShare (see
+            // the IS_TELEGRAM branch's comment near the top of this function) lets a
+            // caller that means "save this file, never share it" skip this method too.
+            if (!(options && options.noShare)) {
             try {
                 if (navigator.share && typeof File !== 'undefined') {
                     const file = new File([blob], safeName, {type: mime || blob.type || 'application/octet-stream'});
@@ -14588,6 +14609,7 @@ window.mu_syncHtmlBg = function(){
                     }
                 }
             } catch (e) { if (e?.name === 'AbortError') return 'cancelled'; console.warn('Share fallback failed', e); }
+            }
 
             // Method 4: open the file in a new tab for manual Save/Download.
             // Same Telegram/in-app-WebView caveat as Method 1 above (a blob: URL
@@ -43256,7 +43278,11 @@ const MU_AI = (function(){
         }
         try {
             const blob = await mAi_dataUrlToBlob(cur.dataUrl);
-            await robustDownload(blob, filename, mime);
+            // noShare: true — this is the "Download"/"Save" button specifically, so
+            // it must always end in a real save to disk and must never itself pop
+            // the OS share sheet (that's what the separate Share button is for; see
+            // mAi_shareLightboxImage and the matching fix in robustDownload).
+            await robustDownload(blob, filename, mime, { noShare: true });
         } catch(e){
             console.error(e);
             const fa = currentLang === 'fa';
@@ -43304,6 +43330,18 @@ const MU_AI = (function(){
             if(e && e.name === 'AbortError') return; // person cancelled the share sheet — not an error
             console.warn('Image share failed, falling back to download:', e);
         }
+        // Bug fix ("Share saves the file instead of opening the share sheet"): this
+        // point is only reached when file-sharing isn't actually usable here (no
+        // navigator.share, canShare({files}) says no, or the call above failed/
+        // timed out) — some in-app WebViews (Telegram's included) report
+        // navigator.share as present but can't really hand off a file. Silently
+        // downloading here used to look identical to tapping "Download" instead,
+        // with no indication of *why* a share sheet never showed up. Saying so
+        // up front makes the fallback legible instead of confusing.
+        const fa = currentLang === 'fa';
+        showToast(fa
+            ? '📥 اشتراک‌گذاری مستقیم روی این مرورگر پشتیبانی نمی‌شود؛ تصویر ذخیره شد.'
+            : '📥 Direct sharing isn\u2019t supported here; the image was saved instead.', 3200);
         await mAi_downloadLightboxImage();
     }
 
