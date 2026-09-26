@@ -17940,12 +17940,36 @@ function mu_cloudSettingsHtml(manualCount){
     </details>`;
 }
 
+// Same "@ or leading digit => force LTR" rule as muAtLtrFixJs below uses for
+// live-typed fields (see that function's long comment for why plain
+// dir="auto" isn't enough): a label with NO letters at all (e.g. "@2026",
+// a bare "26.09.2026") has no strong character for the browser's bidi
+// algorithm to anchor on, so dir="auto" alone would still fall back to the
+// page's RTL base direction and can reorder the separate number groups.
+// Forcing dir="ltr" explicitly in that case (and whenever the first real
+// letter after the "@"/digit isn't Persian/Arabic/Hebrew) keeps a saved
+// label's on-screen order identical to what was typed.
+function mu_labelDirAttr(text){
+    var STRONG_RTL = /[\u0590-\u05FF\u0621-\u064A\u0671-\u06D3\u06FA-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB1D-\uFDFF\uFE70-\uFEFC]/;
+    var STRONG_LTR = /[A-Za-z\u00C0-\u024F]/;
+    var t = String(text || '').replace(/^[\s\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]+/, '');
+    var c0 = t.charAt(0);
+    if (c0 !== '@' && !/^[0-9]/.test(c0)) return 'dir="auto"';
+    for (var i = 1; i < t.length; i++) {
+        var c = t.charAt(i);
+        if (STRONG_RTL.test(c)) return 'dir="auto"';
+        if (STRONG_LTR.test(c)) return 'dir="ltr"';
+    }
+    return 'dir="ltr"';
+}
+
 function mu_cloudBackupRowHtml(e, opts){
     opts=opts||{};
     const fa=currentLang==='fa';
     const label = e.kind==='auto'
         ? (fa?'🔄 آخرین وضعیت (خودکار)':'🔄 Latest state (auto)')
         : (e.label ? `📌 ${escapeHtml(e.label)}` : `📌 ${mu_fmtCloudDate(e.ts)}`);
+    const labelDirAttr = (e.kind!=='auto' && e.label) ? mu_labelDirAttr(e.label) : 'dir="auto"';
     // Upgrade: rough size estimate (chunks × chunk size) next to the note count,
     // so it's visible at a glance how much of a backup slot's budget is used —
     // ties into the size limits now spelled out in the Help panel.
@@ -17954,9 +17978,9 @@ function mu_cloudBackupRowHtml(e, opts){
     const delBtn = opts.allowDelete ? `<button type="button" class="btn-main" data-cloud-action="delete">🗑 ${fa?'حذف':'Delete'}</button>` : '';
     return `<div class="markhin-smart-item" data-backup-id="${escapeHtml(e.id)}" style="margin-bottom:8px">
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">
-            <b style="min-width:0">${label}</b>
+            <b ${labelDirAttr} style="min-width:0">${label}</b>
         </div>
-        <div class="snippet">${sub}</div>
+        <div class="snippet" dir="auto">${sub}</div>
         <div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap">
             <button type="button" class="btn-main" data-cloud-action="view">👁 ${fa?'مشاهده':'View'}</button>
             <button type="button" class="btn-main" data-cloud-action="restore">📥 ${fa?'بازیابی':'Restore'}</button>
